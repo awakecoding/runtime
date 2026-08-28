@@ -1,0 +1,634 @@
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
+new file mode 100644
+index 000000000..31658ac51
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
+@@ -0,0 +1,456 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Buffers;
++using System.Collections.Concurrent;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Text;
++using System.Threading;
++
++using Internal.TypeSystem;
++using Internal.TypeSystem.Ecma;
++
++namespace ILCompiler;
++
++public static class CompilerProfile
++{
++    private const int TopMethodCount = 300;
++    private const int TopTypeCount = 300;
++
++    private static readonly SearchValues<char> s_csvEscapingCharacters = SearchValues.Create(",\"\r\n");
++    private static readonly string s_outputPath = Environment.GetEnvironmentVariable("DOTNET_ILC_PROFILE_PATH");
++    private static readonly bool s_isEnabled = !string.IsNullOrWhiteSpace(s_outputPath);
++    private static readonly bool s_methodsEnabled =
++        s_isEnabled &&
++        bool.TryParse(Environment.GetEnvironmentVariable("DOTNET_ILC_PROFILE_METHODS"), out bool methodsEnabled) &&
++        methodsEnabled;
++    private static readonly long s_profileStartTimestamp = s_isEnabled ? Stopwatch.GetTimestamp() : 0;
++    private static readonly object s_aggregateLock = new object();
++    private static readonly Dictionary<string, Timing> s_phaseTimings = new Dictionary<string, Timing>(StringComparer.Ordinal);
++    private static readonly Dictionary<string, long> s_counters = new Dictionary<string, long>(StringComparer.Ordinal);
++    private static readonly ConcurrentBag<Dictionary<MethodDesc, MethodTiming>> s_methodTimingBatches =
++        new ConcurrentBag<Dictionary<MethodDesc, MethodTiming>>();
++    private static readonly ConcurrentQueue<WorkerSample> s_workerSamples = new ConcurrentQueue<WorkerSample>();
++
++    [ThreadStatic]
++    private static Dictionary<MethodDesc, MethodTiming> t_methodTimings;
++
++    private static int s_activeMethodCompilations;
++    private static int s_initialized;
++    private static int s_maxConcurrentMethodCompilations;
++    private static int s_reportWritten;
++    private static Timer s_workerTimer;
++
++    public static bool MethodProfilingEnabled => s_methodsEnabled;
++
++    public static long Initialize()
++    {
++        if (s_methodsEnabled && Interlocked.Exchange(ref s_initialized, 1) == 0)
++        {
++            s_workerTimer = new Timer(
++                static _ => RecordWorkerSample(),
++                state: null,
++                dueTime: TimeSpan.Zero,
++                period: TimeSpan.FromMilliseconds(100));
++        }
++
++        return GetTimestamp();
++    }
++
++    public static long GetTimestamp()
++    {
++        return s_isEnabled ? Stopwatch.GetTimestamp() : 0;
++    }
++
++    public static long StartMethod()
++    {
++        if (!s_methodsEnabled)
++        {
++            return 0;
++        }
++
++        int activeMethodCompilations = Interlocked.Increment(ref s_activeMethodCompilations);
++        int maxConcurrentMethodCompilations = Volatile.Read(ref s_maxConcurrentMethodCompilations);
++        while (activeMethodCompilations > maxConcurrentMethodCompilations)
++        {
++            int previousValue = Interlocked.CompareExchange(
++                ref s_maxConcurrentMethodCompilations,
++                activeMethodCompilations,
++                maxConcurrentMethodCompilations);
++            if (previousValue == maxConcurrentMethodCompilations)
++            {
++                break;
++            }
++
++            maxConcurrentMethodCompilations = previousValue;
++        }
++
++        return Stopwatch.GetTimestamp();
++    }
++
++    public static void RecordPhase(string name, long startTimestamp)
++    {
++        if (!s_isEnabled || startTimestamp == 0)
++        {
++            return;
++        }
++
++        long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
++        lock (s_aggregateLock)
++        {
++            s_phaseTimings.TryGetValue(name, out Timing timing);
++            timing.Add(elapsedTicks);
++            s_phaseTimings[name] = timing;
++        }
++    }
++
++    public static void RecordSkippedPhase(string name)
++    {
++        if (!s_isEnabled)
++        {
++            return;
++        }
++
++        lock (s_aggregateLock)
++        {
++            s_phaseTimings.TryAdd(name, default);
++        }
++    }
++
++    public static void AddCounter(string name, long value)
++    {
++        if (!s_isEnabled)
++        {
++            return;
++        }
++
++        lock (s_aggregateLock)
++        {
++            s_counters.TryGetValue(name, out long currentValue);
++            s_counters[name] = currentValue + value;
++        }
++    }
++
++    public static void SetCounter(string name, long value)
++    {
++        if (!s_isEnabled)
++        {
++            return;
++        }
++
++        lock (s_aggregateLock)
++        {
++            s_counters[name] = value;
++        }
++    }
++
++    public static void RecordMethod(MethodDesc method, long startTimestamp, bool usedFallbackBody)
++    {
++        if (!s_methodsEnabled || startTimestamp == 0)
++        {
++            return;
++        }
++
++        try
++        {
++            long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
++            Dictionary<MethodDesc, MethodTiming> timings = t_methodTimings;
++            if (timings is null)
++            {
++                timings = new Dictionary<MethodDesc, MethodTiming>();
++                t_methodTimings = timings;
++                s_methodTimingBatches.Add(timings);
++            }
++
++            timings.TryGetValue(method, out MethodTiming timing);
++            timing.Add(elapsedTicks, usedFallbackBody);
++            timings[method] = timing;
++        }
++        finally
++        {
++            Interlocked.Decrement(ref s_activeMethodCompilations);
++        }
++    }
++
++    public static void WriteReport()
++    {
++        if (!s_isEnabled || Interlocked.Exchange(ref s_reportWritten, 1) != 0)
++        {
++            return;
++        }
++
++        s_workerTimer?.Dispose();
++        if (s_methodsEnabled)
++        {
++            RecordWorkerSample();
++        }
++        RecordPhase("compiler-total", s_profileStartTimestamp);
++        SetCounter("gc-gen0-collections", GC.CollectionCount(0));
++        SetCounter("gc-gen1-collections", GC.CollectionCount(1));
++        SetCounter("gc-gen2-collections", GC.CollectionCount(2));
++        SetCounter("managed-allocated-bytes", GC.GetTotalAllocatedBytes(precise: false));
++        SetCounter("max-concurrent-method-compilations", s_maxConcurrentMethodCompilations);
++        SetCounter("process-working-set-bytes-before-report", Environment.WorkingSet);
++        SetCounter("method-profiling-enabled", s_methodsEnabled ? 1 : 0);
++
++        var mergedMethods = new Dictionary<MethodDesc, MethodTiming>();
++        foreach (Dictionary<MethodDesc, MethodTiming> batch in s_methodTimingBatches)
++        {
++            foreach (KeyValuePair<MethodDesc, MethodTiming> pair in batch)
++            {
++                mergedMethods.TryGetValue(pair.Key, out MethodTiming timing);
++                timing.Add(pair.Value);
++                mergedMethods[pair.Key] = timing;
++            }
++        }
++
++        var assemblyTimings = new Dictionary<string, MethodTiming>(StringComparer.Ordinal);
++        var typeTimings = new Dictionary<string, NamedTiming>(StringComparer.Ordinal);
++        var methodTimings = new List<NamedTiming>(mergedMethods.Count);
++        MethodTiming totalMethodTiming = default;
++
++        foreach (KeyValuePair<MethodDesc, MethodTiming> pair in mergedMethods)
++        {
++            MethodDesc method = pair.Key;
++            MethodTiming timing = pair.Value;
++            string assemblyName = GetAssemblyName(method);
++            string typeName = method.OwningType.ToString();
++
++            assemblyTimings.TryGetValue(assemblyName, out MethodTiming assemblyTiming);
++            assemblyTiming.Add(timing);
++            assemblyTimings[assemblyName] = assemblyTiming;
++
++            string typeKey = assemblyName + "\0" + typeName;
++            if (!typeTimings.TryGetValue(typeKey, out NamedTiming typeTiming))
++            {
++                typeTiming = new NamedTiming(typeName, assemblyName);
++                typeTimings.Add(typeKey, typeTiming);
++            }
++            typeTiming.Timing.Add(timing);
++
++            methodTimings.Add(new NamedTiming(method.ToString(), assemblyName, timing));
++            totalMethodTiming.Add(timing);
++        }
++
++        var assemblyRows = new List<NamedTiming>(assemblyTimings.Count);
++        foreach (KeyValuePair<string, MethodTiming> pair in assemblyTimings)
++        {
++            assemblyRows.Add(new NamedTiming(pair.Key, pair.Key, pair.Value));
++        }
++
++        var typeRows = new List<NamedTiming>(typeTimings.Values);
++        assemblyRows.Sort(CompareNamedTiming);
++        typeRows.Sort(CompareNamedTiming);
++        methodTimings.Sort(CompareNamedTiming);
++
++        string outputDirectory = Path.GetDirectoryName(s_outputPath);
++        if (!string.IsNullOrEmpty(outputDirectory))
++        {
++            Directory.CreateDirectory(outputDirectory);
++        }
++
++        string temporaryPath = s_outputPath + ".tmp";
++        using (var writer = new StreamWriter(temporaryPath, append: false, encoding: new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
++        {
++            writer.WriteLine("kind,name,assembly,count,totalMilliseconds,maxMilliseconds,fallbackCount,value");
++
++            var phaseRows = new List<KeyValuePair<string, Timing>>();
++            var counterRows = new List<KeyValuePair<string, long>>();
++            lock (s_aggregateLock)
++            {
++                phaseRows.AddRange(s_phaseTimings);
++                counterRows.AddRange(s_counters);
++            }
++
++            phaseRows.Sort(CompareTiming);
++            counterRows.Sort(CompareCounter);
++            foreach (KeyValuePair<string, Timing> pair in phaseRows)
++            {
++                WriteRow(writer, "phase", pair.Key, "", pair.Value.Count, pair.Value.TotalTicks, pair.Value.MaxTicks, 0, "");
++            }
++            foreach (KeyValuePair<string, long> pair in counterRows)
++            {
++                WriteRow(writer, "counter", pair.Key, "", 0, 0, 0, 0, pair.Value.ToString(CultureInfo.InvariantCulture));
++            }
++            foreach (WorkerSample sample in s_workerSamples)
++            {
++                WriteRow(writer, "worker-sample", "active-method-compilations", "", sample.ActiveMethodCompilations, sample.ElapsedTicks, 0, 0, "");
++            }
++
++            WriteRow(writer, "aggregate", "method-codegen-total", "", totalMethodTiming.Count, totalMethodTiming.TotalTicks, totalMethodTiming.MaxTicks, totalMethodTiming.FallbackCount, "");
++            foreach (NamedTiming row in assemblyRows)
++            {
++                WriteRow(writer, "assembly", row.Name, row.AssemblyName, row.Timing.Count, row.Timing.TotalTicks, row.Timing.MaxTicks, row.Timing.FallbackCount, "");
++            }
++
++            int typeCount = Math.Min(TopTypeCount, typeRows.Count);
++            for (int i = 0; i < typeCount; i++)
++            {
++                NamedTiming row = typeRows[i];
++                WriteRow(writer, "type", row.Name, row.AssemblyName, row.Timing.Count, row.Timing.TotalTicks, row.Timing.MaxTicks, row.Timing.FallbackCount, "");
++            }
++
++            int methodCount = Math.Min(TopMethodCount, methodTimings.Count);
++            for (int i = 0; i < methodCount; i++)
++            {
++                NamedTiming row = methodTimings[i];
++                WriteRow(writer, "method", row.Name, row.AssemblyName, row.Timing.Count, row.Timing.TotalTicks, row.Timing.MaxTicks, row.Timing.FallbackCount, "");
++            }
++        }
++
++        File.Move(temporaryPath, s_outputPath, overwrite: true);
++    }
++
++    private static void RecordWorkerSample()
++    {
++        s_workerSamples.Enqueue(new WorkerSample(
++            Stopwatch.GetTimestamp() - s_profileStartTimestamp,
++            Volatile.Read(ref s_activeMethodCompilations)));
++    }
++
++    private static string GetAssemblyName(MethodDesc method)
++    {
++        if (method.GetTypicalMethodDefinition() is EcmaMethod ecmaMethod)
++        {
++            return ecmaMethod.Module.Assembly.GetName().Name;
++        }
++
++        return "<compiler-generated>";
++    }
++
++    private static int CompareNamedTiming(NamedTiming left, NamedTiming right)
++    {
++        int result = right.Timing.TotalTicks.CompareTo(left.Timing.TotalTicks);
++        return result != 0 ? result : StringComparer.Ordinal.Compare(left.Name, right.Name);
++    }
++
++    private static int CompareTiming(KeyValuePair<string, Timing> left, KeyValuePair<string, Timing> right)
++    {
++        return StringComparer.Ordinal.Compare(left.Key, right.Key);
++    }
++
++    private static int CompareCounter(KeyValuePair<string, long> left, KeyValuePair<string, long> right)
++    {
++        return StringComparer.Ordinal.Compare(left.Key, right.Key);
++    }
++
++    private static void WriteRow(
++        StreamWriter writer,
++        string kind,
++        string name,
++        string assembly,
++        long count,
++        long totalTicks,
++        long maxTicks,
++        long fallbackCount,
++        string value)
++    {
++        writer.Write(Escape(kind));
++        writer.Write(',');
++        writer.Write(Escape(name));
++        writer.Write(',');
++        writer.Write(Escape(assembly));
++        writer.Write(',');
++        writer.Write(count.ToString(CultureInfo.InvariantCulture));
++        writer.Write(',');
++        writer.Write(ToMilliseconds(totalTicks));
++        writer.Write(',');
++        writer.Write(ToMilliseconds(maxTicks));
++        writer.Write(',');
++        writer.Write(fallbackCount.ToString(CultureInfo.InvariantCulture));
++        writer.Write(',');
++        writer.WriteLine(Escape(value));
++    }
++
++    private static string ToMilliseconds(long ticks)
++    {
++        double milliseconds = (double)ticks * 1000.0 / Stopwatch.Frequency;
++        return milliseconds.ToString("F3", CultureInfo.InvariantCulture);
++    }
++
++    private static string Escape(string value)
++    {
++        if (!value.AsSpan().ContainsAny(s_csvEscapingCharacters))
++        {
++            return value;
++        }
++
++        return "\"" + value.Replace("\"", "\"\"") + "\"";
++    }
++
++    private struct Timing
++    {
++        public long Count;
++        public long TotalTicks;
++        public long MaxTicks;
++
++        public void Add(long ticks)
++        {
++            Count++;
++            TotalTicks += ticks;
++            MaxTicks = Math.Max(MaxTicks, ticks);
++        }
++    }
++
++    private struct MethodTiming
++    {
++        public long Count;
++        public long TotalTicks;
++        public long MaxTicks;
++        public long FallbackCount;
++
++        public void Add(long ticks, bool usedFallbackBody)
++        {
++            Count++;
++            TotalTicks += ticks;
++            MaxTicks = Math.Max(MaxTicks, ticks);
++            if (usedFallbackBody)
++            {
++                FallbackCount++;
++            }
++        }
++
++        public void Add(MethodTiming other)
++        {
++            Count += other.Count;
++            TotalTicks += other.TotalTicks;
++            MaxTicks = Math.Max(MaxTicks, other.MaxTicks);
++            FallbackCount += other.FallbackCount;
++        }
++    }
++
++    private readonly struct WorkerSample
++    {
++        public WorkerSample(long elapsedTicks, int activeMethodCompilations)
++        {
++            ElapsedTicks = elapsedTicks;
++            ActiveMethodCompilations = activeMethodCompilations;
++        }
++
++        public long ElapsedTicks { get; }
++        public int ActiveMethodCompilations { get; }
++    }
++
++    private sealed class NamedTiming
++    {
++        public NamedTiming(string name, string assemblyName)
++        {
++            Name = name;
++            AssemblyName = assemblyName;
++        }
++
++        public NamedTiming(string name, string assemblyName, MethodTiming timing)
++            : this(name, assemblyName)
++        {
++            Timing = timing;
++        }
++
++        public string Name { get; }
++        public string AssemblyName { get; }
++        public MethodTiming Timing;
++    }
++}
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs
+index 93a2e79d9..b35fa721b 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs
+@@ -691 +691,9 @@ protected void EnsureMetadataGenerated(NodeFactory factory)
+-            ComputeMetadata(factory, out _metadataBlob, out _typeMappings, out _methodMappings, out _methodHandleMap, out _fieldMappings, out _fieldHandleMap, out _stackTraceMappings);
++            long metadataStart = CompilerProfile.GetTimestamp();
++            try
++            {
++                ComputeMetadata(factory, out _metadataBlob, out _typeMappings, out _methodMappings, out _methodHandleMap, out _fieldMappings, out _fieldHandleMap, out _stackTraceMappings);
++            }
++            finally
++            {
++                CompilerProfile.RecordPhase("metadata-computation", metadataStart);
++            }
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
+index 862404c49..814e4340e 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
+@@ -494,0 +495 @@
++    <Compile Include="Compiler\CompilerProfile.cs" />
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
+index 98b214e2b..494814f02 100644
+--- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
+@@ -6,0 +7 @@
++using System.IO;
+@@ -101,0 +103,3 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            CompilerProfile.SetCounter("configured-parallelism", _parallelism);
++
++            long dependencyGraphStart = CompilerProfile.GetTimestamp();
+@@ -102,0 +107 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            CompilerProfile.RecordPhase("dependency-graph-and-codegen", dependencyGraphStart);
+@@ -103,0 +109 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            CompilerProfile.SetCounter("marked-node-count", nodes.Length);
+@@ -104,0 +111 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            long fileLayoutStart = CompilerProfile.GetTimestamp();
+@@ -105,0 +113 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            CompilerProfile.RecordPhase("file-layout", fileLayoutStart);
+@@ -118,0 +127 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            long objectEmissionStart = CompilerProfile.GetTimestamp();
+@@ -119,0 +129,2 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            CompilerProfile.RecordPhase("object-emission", objectEmissionStart);
++            CompilerProfile.SetCounter("output-object-bytes", new FileInfo(outputFile).Length);
+@@ -149,0 +161,4 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
++            CompilerProfile.AddCounter("dependency-batch-count", 1);
++            CompilerProfile.AddCounter("methods-queued-for-codegen", methodsToCompile.Count);
++
++            long methodCodegenStart = CompilerProfile.GetTimestamp();
+@@ -152 +167 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+-                CompileSingleThreaded(methodsToCompile);
++                CompileSingleThreaded(methodsToCompile, CompilerProfile.MethodProfilingEnabled);
+@@ -156 +171 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+-                CompileMultiThreaded(methodsToCompile);
++                CompileMultiThreaded(methodsToCompile, CompilerProfile.MethodProfilingEnabled);
+@@ -157,0 +173 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
++            CompilerProfile.RecordPhase("method-codegen-batches-wall", methodCodegenStart);
+@@ -159 +175,2 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+-        private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
++
++        private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile, bool profileMethods)
+@@ -165,0 +183 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
++            Action<MethodCodeNode> compileMethod = profileMethods ? CompileSingleMethodProfiled : CompileSingleMethod;
+@@ -169 +187 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
+-                CompileSingleMethod);
++                compileMethod);
+@@ -172,2 +190 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
+-
+-        private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile)
++        private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile, bool profileMethods)
+@@ -184 +201,8 @@ private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile)
+-                CompileSingleMethod(corInfo, methodCodeNodeNeedingCode);
++                if (profileMethods)
++                {
++                    CompileSingleMethodProfiled(corInfo, methodCodeNodeNeedingCode);
++                }
++                else
++                {
++                    CompileSingleMethod(corInfo, methodCodeNodeNeedingCode);
++                }
+@@ -194 +218,7 @@ private void CompileSingleMethod(MethodCodeNode methodCodeNodeNeedingCode)
+-        private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
++        private void CompileSingleMethodProfiled(MethodCodeNode methodCodeNodeNeedingCode)
++        {
++            CorInfoImpl corInfo = _corinfos.GetValue(Thread.CurrentThread, thread => new CorInfoImpl(this));
++            CompileSingleMethodProfiled(corInfo, methodCodeNodeNeedingCode);
++        }
++
++        private void CompileSingleMethodProfiled(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
+@@ -196,0 +227,11 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
++            long methodStart = CompilerProfile.StartMethod();
++            bool usedFallbackBody = false;
++            try
++            {
++                usedFallbackBody = CompileSingleMethod(corInfo, methodCodeNodeNeedingCode);
++            }
++            finally
++            {
++                CompilerProfile.RecordMethod(method, methodStart, usedFallbackBody);
++            }
++        }
+@@ -197,0 +239,3 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
++        private bool CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
++        {
++            MethodDesc method = methodCodeNodeNeedingCode.Method;
+@@ -214 +258 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+-            if (exception != null)
++            if (exception == null)
+@@ -216,10 +260,2 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+-                if (exception is TypeSystemException.InvalidProgramException
+-                    && method.OwningType is MetadataType mdOwningType
+-                    && mdOwningType.HasCustomAttribute("System.Runtime.InteropServices", "ClassInterfaceAttribute"))
+-                {
+-                    Logger.LogWarning(method, DiagnosticId.COMInteropNotSupportedInFullAOT);
+-                }
+-                if ((_compilationOptions & RyuJitCompilationOptions.UseResilience) != 0)
+-                    Logger.LogMessage($"Method '{method}' will always throw because: {exception.Message}");
+-                else
+-                    Logger.LogError($"Method will always throw because: {exception.Message}", 1005, method, MessageSubCategory.AotAnalysis);
++                return false;
++            }
+@@ -227,3 +263,5 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+-                // Try to compile the method again, but with a throwing method body this time.
+-                MethodIL throwingIL = TypeSystemThrowingILEmitter.EmitIL(method, exception);
+-                corInfo.CompileMethod(methodCodeNodeNeedingCode, throwingIL);
++            if (exception is TypeSystemException.InvalidProgramException
++                && method.OwningType is MetadataType mdOwningType
++                && mdOwningType.HasCustomAttribute("System.Runtime.InteropServices", "ClassInterfaceAttribute"))
++            {
++                Logger.LogWarning(method, DiagnosticId.COMInteropNotSupportedInFullAOT);
+@@ -230,0 +269,10 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
++            if ((_compilationOptions & RyuJitCompilationOptions.UseResilience) != 0)
++                Logger.LogMessage($"Method '{method}' will always throw because: {exception.Message}");
++            else
++                Logger.LogError($"Method will always throw because: {exception.Message}", 1005, method, MessageSubCategory.AotAnalysis);
++
++            // Try to compile the method again, but with a throwing method body this time.
++            MethodIL throwingIL = TypeSystemThrowingILEmitter.EmitIL(method, exception);
++            corInfo.CompileMethod(methodCodeNodeNeedingCode, throwingIL);
++
++            return true;
+diff --git a/src/coreclr/tools/aot/ILCompiler/Program.cs b/src/coreclr/tools/aot/ILCompiler/Program.cs
+index 04795875d..d7d5ea1dd 100644
+--- a/src/coreclr/tools/aot/ILCompiler/Program.cs
++++ b/src/coreclr/tools/aot/ILCompiler/Program.cs
+@@ -73,0 +74 @@ public int Run()
++            long initializationStart = CompilerProfile.Initialize();
+@@ -489,0 +491,2 @@ public int Run()
++            CompilerProfile.RecordPhase("input-and-type-system-setup", initializationStart);
++            CompilerProfile.SetCounter("scanner-enabled", useScanner ? 1 : 0);
+@@ -491,0 +495 @@ public int Run()
++                long scannerStart = CompilerProfile.GetTimestamp();
+@@ -494,0 +499,5 @@ public int Run()
++                CompilerProfile.RecordPhase("scanner-and-analysis-integration", scannerStart);
++            }
++            else
++            {
++                CompilerProfile.RecordSkippedPhase("scanner-and-analysis-integration");
+@@ -496,0 +506,2 @@ public int Run()
++            long compilationSetupStart = CompilerProfile.GetTimestamp();
++
+@@ -627,0 +639 @@ void RunScanner()
++            CompilerProfile.RecordPhase("compilation-setup", compilationSetupStart);
+@@ -643,0 +656 @@ void RunScanner()
++            long compilationStart = CompilerProfile.GetTimestamp();
+@@ -644,0 +658,2 @@ void RunScanner()
++            CompilerProfile.RecordPhase("compilation-total", compilationStart);
++            long finalizationStart = CompilerProfile.GetTimestamp();
+@@ -718,0 +734,3 @@ static bool IsRelatedToInvalidInput(MethodDesc method)
++            CompilerProfile.RecordPhase("finalization", finalizationStart);
++            CompilerProfile.WriteReport();
++

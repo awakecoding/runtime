@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <_NativeAotOriginalDirectoryBuildPropsDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(MSBuildProjectDirectory)', 'Directory.Build.props'))</_NativeAotOriginalDirectoryBuildPropsDirectory>
+    <_NativeAotOriginalDirectoryBuildProps>$([System.IO.Path]::Combine('$(_NativeAotOriginalDirectoryBuildPropsDirectory)', 'Directory.Build.props'))</_NativeAotOriginalDirectoryBuildProps>
+  </PropertyGroup>
+
+  <Import Project="$(_NativeAotOriginalDirectoryBuildProps)"
+          Condition="Exists('$(_NativeAotOriginalDirectoryBuildProps)')" />
+
+  <PropertyGroup>
+    <_NativeAotProfileProjectHash>$([MSBuild]::StableStringHash('$(MSBuildProjectFullPath)', 'Sha256'))</_NativeAotProfileProjectHash>
+    <_NativeAotProfileProjectKey>$(MSBuildProjectName)-$(_NativeAotProfileProjectHash.Substring(0, 8))</_NativeAotProfileProjectKey>
+    <BaseIntermediateOutputPath>$([MSBuild]::NormalizeDirectory('$(NativeAotProfileRoot)', 'obj', '$(_NativeAotProfileProjectKey)'))</BaseIntermediateOutputPath>
+    <BaseOutputPath>$([MSBuild]::NormalizeDirectory('$(NativeAotProfileRoot)', 'bin', '$(_NativeAotProfileProjectKey)'))</BaseOutputPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

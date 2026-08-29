@@ -16,7 +16,17 @@ param(
 
     [int] $SampleIntervalMilliseconds = 1000,
 
-    [switch] $ProfileMethods
+    [switch] $ProfileMethods,
+
+    [int] $MinimumFreeMemoryGiB = 0,
+
+    [int] $MaximumCpuLoadPercent = 100,
+
+    [int] $GuardSampleCount = 3,
+
+    [int] $GuardSampleIntervalSeconds = 5,
+
+    [int] $GuardTimeoutSeconds = 1800
 )
 
 Set-StrictMode -Version Latest
@@ -25,6 +35,40 @@ $ErrorActionPreference = 'Stop'
 if ($SampleIntervalMilliseconds -lt 100)
 {
     throw 'SampleIntervalMilliseconds must be at least 100.'
+}
+if ($GuardSampleCount -lt 1 -or $GuardSampleIntervalSeconds -lt 1 -or $GuardTimeoutSeconds -lt 1)
+{
+    throw 'Guard sample count, interval, and timeout must be positive.'
+}
+
+function Get-MachineSnapshot
+{
+    $operatingSystem = Get-CimInstance Win32_OperatingSystem
+    $processors = @(Get-CimInstance Win32_Processor)
+    $processorPerformance = Get-CimInstance `
+        Win32_PerfFormattedData_Counters_ProcessorInformation `
+        -Filter "Name='_Total'" `
+        -ErrorAction SilentlyContinue
+    $thermalZones = @(
+        Get-CimInstance `
+            -Namespace root/wmi `
+            -ClassName MSAcpi_ThermalZoneTemperature `
+            -ErrorAction SilentlyContinue
+    )
+
+    [pscustomobject] @{
+        TimestampUtc = [DateTime]::UtcNow
+        FreePhysicalMemoryBytes = [UInt64]$operatingSystem.FreePhysicalMemory * 1KB
+        CpuLoadPercent = ($processors | Measure-Object LoadPercentage -Average).Average
+        CurrentClockSpeedMHz = ($processors | Measure-Object CurrentClockSpeed -Average).Average
+        MaximumClockSpeedMHz = ($processors | Measure-Object MaxClockSpeed -Average).Average
+        PerformanceClockSpeedMHz = if ($processorPerformance) { $processorPerformance.ProcessorFrequency } else { $null }
+        PercentMaximumFrequency = if ($processorPerformance) { $processorPerformance.PercentofMaximumFrequency } else { $null }
+        ThermalZoneCelsius = @(
+            $thermalZones |
+                ForEach-Object { ($_.CurrentTemperature / 10) - 273.15 }
+        )
+    }
 }
 
 $ilcPath = (Resolve-Path -LiteralPath $IlcPath).Path
@@ -37,6 +81,46 @@ if (Test-Path $runRoot)
 }
 
 New-Item -ItemType Directory -Path $runRoot | Out-Null
+$guardSamples = [System.Collections.Generic.List[object]]::new()
+$guardStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$consecutiveGuardSamples = 0
+$requiredGuardSamples =
+    if ($MinimumFreeMemoryGiB -gt 0 -or $MaximumCpuLoadPercent -lt 100) { $GuardSampleCount } else { 1 }
+do
+{
+    $machineSnapshot = Get-MachineSnapshot
+    $guardAccepted =
+        $machineSnapshot.FreePhysicalMemoryBytes -ge $MinimumFreeMemoryGiB * 1GB -and
+        $machineSnapshot.CpuLoadPercent -le $MaximumCpuLoadPercent
+    $guardSamples.Add([pscustomobject] @{
+        TimestampUtc = $machineSnapshot.TimestampUtc
+        FreePhysicalMemoryBytes = $machineSnapshot.FreePhysicalMemoryBytes
+        CpuLoadPercent = $machineSnapshot.CpuLoadPercent
+        CurrentClockSpeedMHz = $machineSnapshot.CurrentClockSpeedMHz
+        MaximumClockSpeedMHz = $machineSnapshot.MaximumClockSpeedMHz
+        PerformanceClockSpeedMHz = $machineSnapshot.PerformanceClockSpeedMHz
+        PercentMaximumFrequency = $machineSnapshot.PercentMaximumFrequency
+        ThermalZoneCelsius = $machineSnapshot.ThermalZoneCelsius -join ';'
+        Accepted = $guardAccepted
+    })
+    $consecutiveGuardSamples = if ($guardAccepted) { $consecutiveGuardSamples + 1 } else { 0 }
+
+    if ($consecutiveGuardSamples -lt $requiredGuardSamples)
+    {
+        if ($guardStopwatch.Elapsed.TotalSeconds -ge $GuardTimeoutSeconds)
+        {
+            $guardSamples |
+                Export-Csv -LiteralPath (Join-Path $runRoot 'machine-guard.csv') -NoTypeInformation
+            throw "Machine guard timed out after $GuardTimeoutSeconds seconds."
+        }
+        Start-Sleep -Seconds $GuardSampleIntervalSeconds
+    }
+}
+while ($consecutiveGuardSamples -lt $requiredGuardSamples)
+$guardStopwatch.Stop()
+$guardSamples | Export-Csv -LiteralPath (Join-Path $runRoot 'machine-guard.csv') -NoTypeInformation
+$machineBefore = $machineSnapshot
+
 $localResponse = Join-Path $runRoot 'input.ilc.rsp'
 $objectPath = Join-Path $runRoot 'output.obj'
 $profilePath = Join-Path $runRoot 'ilc-profile.csv'
@@ -141,6 +225,8 @@ try
                 CpuSeconds = $process.TotalProcessorTime.TotalSeconds
                 WorkingSetBytes = $process.WorkingSet64
                 PeakWorkingSetBytes = $process.PeakWorkingSet64
+                PrivateMemoryBytes = $process.PrivateMemorySize64
+                PagedMemoryBytes = $process.PagedMemorySize64
                 ThreadCount = @($process.Threads).Count
                 ReadBytes = if ($cimProcess) { [UInt64] $cimProcess.ReadTransferCount } else { 0 }
                 WriteBytes = if ($cimProcess) { [UInt64] $cimProcess.WriteTransferCount } else { 0 }
@@ -186,6 +272,7 @@ if ($process.ExitCode -eq 0 -and -not (Test-Path -LiteralPath $profilePath))
     throw "ILC completed without writing a profile. Confirm the profiling patch is applied: $profilePath"
 }
 
+$machineAfter = Get-MachineSnapshot
 $samples | Export-Csv -LiteralPath (Join-Path $runRoot 'ilc-samples.csv') -NoTypeInformation
 $metadata = [pscustomobject] @{
     ExitCode = $process.ExitCode
@@ -195,12 +282,22 @@ $metadata = [pscustomobject] @{
     AverageLogicalCores = $process.TotalProcessorTime.TotalSeconds / $stopwatch.Elapsed.TotalSeconds
     LogicalProcessorCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
     PeakWorkingSetBytes = ($samples | Measure-Object PeakWorkingSetBytes -Maximum).Maximum
+    PeakPrivateMemoryBytes = ($samples | Measure-Object PrivateMemoryBytes -Maximum).Maximum
+    PeakPagedMemoryBytes = ($samples | Measure-Object PagedMemoryBytes -Maximum).Maximum
     MaximumThreadCount = ($samples | Measure-Object ThreadCount -Maximum).Maximum
     ReadBytes = ($samples | Measure-Object ReadBytes -Maximum).Maximum
     WriteBytes = ($samples | Measure-Object WriteBytes -Maximum).Maximum
     SampleCount = $samples.Count
     Experiments = $Experiments
     ProfileMethods = $ProfileMethods.IsPresent
+    MachineGuard = [pscustomobject] @{
+        MinimumFreeMemoryGiB = $MinimumFreeMemoryGiB
+        MaximumCpuLoadPercent = $MaximumCpuLoadPercent
+        RequiredConsecutiveSamples = $requiredGuardSamples
+        WaitSeconds = $guardStopwatch.Elapsed.TotalSeconds
+    }
+    MachineBefore = $machineBefore
+    MachineAfter = $machineAfter
     IlcPath = $ilcPath
     IlcExeSha256 = (Get-FileHash $ilcPath -Algorithm SHA256).Hash
     IlcDllSha256 = (Get-FileHash (Join-Path (Split-Path $ilcPath) 'ilc.dll') -Algorithm SHA256).Hash

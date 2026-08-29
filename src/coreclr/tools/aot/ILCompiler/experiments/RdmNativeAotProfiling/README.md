@@ -367,6 +367,99 @@ Three additional gates were screened but did not consume a full RDM run:
 * `large-coff-buffer` used a 1 MB sequential file buffer but did not improve the 95 MB
   EntryModel object-write phase.
 
+## Wave 2 optimization experiments
+
+Wave 2 used the Wave 1 lessons to test narrower representations and hot loops rather than
+larger eager reservations. The exact response remained unchanged. All fresh controls and
+variants in this wave produced a 3,744,339,247-byte object with SHA-256
+`A267FA3F2402258BAFC93EFDE72DAE04AB1050959788D6CCDB8B64BC477DFFD9`.
+The fresh closure was 30,666,605 nodes, 3,526,010 sections, 18,258,144 symbol records, and
+41,018,549 COFF relocation records.
+
+This is 11 nodes, three sections, 19 symbols, and 3,051 bytes above the Wave 1 object. The
+drift appeared after rebuilding the compiler with the additional gated implementations, but
+was stable across every Wave 2 control and experiment, including controls after a subsequent
+compiler rebuild. Its precise scheduling-sensitive source was not isolated. Wave 2 therefore
+uses only controls from the same source generation and requires identity to the fresh object.
+
+`Invoke-IlcProfile.ps1` now gates a run on consecutive free-memory and background-CPU
+samples, and records start/end free memory, CPU load, current/max frequency indicators,
+private bytes, paged bytes, and working set. Runs normally required three samples with at
+least 25-27 GiB available and no more than 15% CPU load. No ACPI thermal-zone data was
+available on this machine.
+
+| Hypothesis | Structural evidence | Targeted full-RDM result | Verdict |
+| --- | --- | --- | --- |
+| Inline singleton conditional buckets | 5,724,010 buckets; 1,189,313 promoted to a multi-entry set | Allocation fell 0.68-0.76 GiB, but graph/mark did not beat controls and wall was 712.59 s | **Regression: reject** |
+| Batch small COFF writes | 66,335,850 logical writes became 1,919 underlying writes; 1.872 GiB was copied through the buffer | File write was 36.39 s versus 48.02/33.41 s controls; the warm control was faster without the extra copy | **Neutral: reject** |
+| Skip UTF-8 counting for clearly long names | Applied across 3,526,010 section and 18,258,144 symbol records | Symbol write was 24.10 s versus 20.51/21.37 s controls; allocation was unchanged | **Regression: reject** |
+| Store COFF relocations as values | Replaced one heap record per 41,018,549 relocations with 12-byte values | Allocation fell 0.51-0.67 GiB. Conversion was 8.35 s versus 15.15/8.23 s controls, so timing did not repeat beyond the warm floor | **Win: memory; wall neutral** |
+| Store COFF symbols as chunked values | 18,258,144 records occupied 279 chunks with only 26,400 unused slots | Allocation fell 0.50-0.73 GiB and peak private memory by up to 0.97 GiB, but symbol write rose to 35.72 s from 21.37/22.85 s | **Regression: reject** |
+
+The compact-symbol prototype was corrected to use readonly writes and a ref-returning,
+chunk-cached enumerator after the first full run exposed defensive-copy risk. Three
+interleaved EntryModel pairs remained neutral to slower: median symbol write was 101.5 ms
+with compact symbols versus 95.0 ms in controls. It was not given another expensive RDM run.
+This is the key representation lesson: removing heap objects is insufficient when iteration
+adds indirection or value-copy costs.
+
+The initial Wave 2 screen also rejected a broad 1,024-entry `NodeCache` capacity hint and a
+broad lock-free type-system table hint. The latter added about 290 MB on EntryModel. Compact
+relocation and symbol representations replaced those candidates before full RDM testing.
+
+### Wave 2 full-run matrix
+
+The controls still moved from 619.11 to 676.18 seconds. Targeted phases, allocation, and
+within-build byte identity remain the primary evidence.
+
+| Run | Wall | Graph | Object | Allocation | Peak private |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control A | 676.18 s | 436.29 s | 236.57 s | 115.45 GiB | 35.43 GiB |
+| Conditional singleton bucket | 712.59 s | 443.74 s | 265.37 s | 114.77 GiB | 36.18 GiB |
+| Batched COFF writes | 660.47 s | 447.16 s | 209.70 s | 115.57 GiB | 35.53 GiB |
+| Control B | 666.90 s | 445.52 s | 217.35 s | 115.53 GiB | 35.64 GiB |
+| Fast long-name classification | 651.90 s | 440.29 s | 207.79 s | 115.62 GiB | 36.29 GiB |
+| Compact COFF relocations | 638.62 s | 431.55 s | 203.01 s | 115.02 GiB | 35.50 GiB |
+| Control C | 619.11 s | 419.81 s | 195.60 s | 115.69 GiB | 36.25 GiB |
+| Compact COFF symbols | 668.87 s | 441.60 s | 223.46 s | 114.96 GiB | 35.28 GiB |
+| Control D | 636.60 s | 436.48 s | 196.48 s | 115.46 GiB | 35.41 GiB |
+
+### Combined Wave 1 and Wave 2 result
+
+The cumulative candidate added compact COFF relocations to the accepted Wave 1 set:
+
+```text
+compact-section-data;lazy-relocation-lists;string-table-hashset;compact-coff-relocations
+```
+
+It was bracketed by fresh controls E and F from the same corrected compiler build. The
+candidate began at 76% reported maximum frequency versus 88-89% for the controls, which
+explains much of its slower graph phase. Its total of 652.82 seconds was 0.8% above the
+647.60-second control midpoint and is neutral.
+
+| Metric | Control E/F midpoint | Combined | Change |
+| --- | ---: | ---: | ---: |
+| Object emission | 218.55 s | 206.17 s | -12.38 s (-5.67%) |
+| Node materialization | 124.88 s | 115.05 s | -9.83 s (-7.87%) |
+| Relocation resolution | 21.34 s | 21.11 s | -0.23 s (-1.08%) |
+| Relocation conversion | 13.64 s | 5.81 s | -7.83 s (-57.40%) |
+| COFF string reservation | 14.69 s | 4.37 s | -10.32 s (-70.25%) |
+| Object file write | 46.73 s | 53.62 s | +6.89 s (+14.75%) |
+| Managed allocation | 115.48-115.78 GiB | 113.99 GiB | -1.49 to -1.79 GiB |
+| Peak private memory | 35.65 GiB | 34.37 GiB | -1.28 GiB |
+
+The allocation and targeted object-work reductions are compatible and repeat the mechanisms
+seen independently. They are insufficient to claim an end-to-end wall win because file-write
+cache effects moved oppositely and the serial graph still dominates. Raw Wave 2 evidence is
+under `artifacts\nativeaot-profile\experiments\wave2-full-rdm`; the compact table is
+`artifacts\nativeaot-profile\experiments\wave2-full-rdm-summary.csv`.
+
+The cumulative object linked successfully in 37.57 seconds to a 1,038,627,840-byte RDM
+executable with SHA-256
+`03A2410172683BF5072245C926C256E552931BF7F24D6280EAE864EA6042D162`.
+The reconstructed v10.0.11 compiler build succeeded, and
+`ILCompiler.Compiler.Tests` passed 21 of 21 tests.
+
 ## Reproduction
 
 1. Check out runtime tag `v10.0.11`.

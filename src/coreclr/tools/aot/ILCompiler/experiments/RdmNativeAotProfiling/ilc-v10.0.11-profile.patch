@@ -11,6 +11,50 @@ index 62297efb6..3293153ba 100644
 +            {
 +                return value is ObjectNode;
 +            }
+diff --git a/src/coreclr/tools/Common/TypeSystem/Common/Utilities/LockFreeReaderHashtable.cs b/src/coreclr/tools/Common/TypeSystem/Common/Utilities/LockFreeReaderHashtable.cs
+index 1b772684d..40d1d04f8 100644
+--- a/src/coreclr/tools/Common/TypeSystem/Common/Utilities/LockFreeReaderHashtable.cs
++++ b/src/coreclr/tools/Common/TypeSystem/Common/Utilities/LockFreeReaderHashtable.cs
+@@ -12,0 +13,26 @@ namespace Internal.TypeSystem
++    internal static class LockFreeReaderHashtableMetrics
++    {
++        private static readonly char[] s_separators = new char[] { ',', ';', ' ' };
++
++        public static bool CapacityHintEnabled { get; } = IsExperimentEnabled("lockfree-table-capacity-hint");
++
++        private static bool IsExperimentEnabled(string name)
++        {
++            string value = Environment.GetEnvironmentVariable("DOTNET_ILC_EXPERIMENTS") ?? string.Empty;
++            if (string.IsNullOrWhiteSpace(value))
++            {
++                return false;
++            }
++
++            foreach (string experiment in value.Split(s_separators, StringSplitOptions.RemoveEmptyEntries))
++            {
++                if (string.Equals(experiment, name, StringComparison.OrdinalIgnoreCase))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++
+@@ -52 +78 @@ public abstract class LockFreeReaderHashtable<TKey, TValue> where TValue : class
+-        private volatile TValue[] _hashtable = new TValue[_initialSize];
++        private volatile TValue[] _hashtable;
+@@ -80 +106 @@ public abstract class LockFreeReaderHashtable<TKey, TValue> where TValue : class
+-        private volatile int _resizeCount = _initialSize * _fillPercentageBeforeResize / 100;
++        private volatile int _resizeCount;
+@@ -150,0 +177,3 @@ public LockFreeReaderHashtable()
++            int initialSize = LockFreeReaderHashtableMetrics.CapacityHintEnabled ? 1024 : _initialSize;
++            _hashtable = new TValue[initialSize];
++            _resizeCount = initialSize * _fillPercentageBeforeResize / 100;
+@@ -157 +186 @@ public LockFreeReaderHashtable()
+-                int lastBit = _initialSize >> i;
++                int lastBit = initialSize >> i;
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
 new file mode 100644
 index 000000000..a73c222b5
@@ -485,6 +529,35 @@ index 000000000..a73c222b5
 +        public MethodTiming Timing;
 +    }
 +}
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
+index 8afd930fb..b77b8a968 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
+@@ -163,0 +164,3 @@ protected struct NodeCache<TKey, TValue>
++            private const int ExperimentInitialCapacity = 1024;
++            private static readonly bool s_capacityHintEnabled = IlcOptimizationExperiments.IsEnabled("node-cache-capacity-hint");
++
+@@ -170 +173,7 @@ public NodeCache(Func<TKey, TValue> creator, IEqualityComparer<TKey> comparer)
+-                _cache = new ConcurrentDictionary<TKey, TValue>(comparer);
++                _cache = s_capacityHintEnabled ?
++                    new ConcurrentDictionary<TKey, TValue>(Environment.ProcessorCount, ExperimentInitialCapacity, comparer) :
++                    new ConcurrentDictionary<TKey, TValue>(comparer);
++                if (s_capacityHintEnabled)
++                {
++                    IlcOptimizationExperiments.AddCounter("node-cache-capacity-hint-count", 1);
++                }
+@@ -176 +185,10 @@ public NodeCache(Func<TKey, TValue> creator)
+-                _cache = new ConcurrentDictionary<TKey, TValue>();
++                _cache = s_capacityHintEnabled ?
++                    new ConcurrentDictionary<TKey, TValue>(
++                        Environment.ProcessorCount,
++                        ExperimentInitialCapacity,
++                        EqualityComparer<TKey>.Default) :
++                    new ConcurrentDictionary<TKey, TValue>();
++                if (s_capacityHintEnabled)
++                {
++                    IlcOptimizationExperiments.AddCounter("node-cache-capacity-hint-count", 1);
++                }
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs
 index 93a2e79d9..b35fa721b 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/MetadataManager.cs
@@ -516,12 +589,16 @@ index f54d68cf0..9b883e7b3 100644
 +            }
 +
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
-index d6deb2760..5a0cafad4 100644
+index d6deb2760..19078da1c 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
-@@ -50 +50,20 @@ internal sealed class CoffObjectWriter : ObjectWriter
+@@ -50 +50,29 @@ internal sealed class CoffObjectWriter : ObjectWriter
 -        private sealed record SectionDefinition(CoffSectionHeader Header, Stream Stream, List<CoffRelocation> Relocations, string ComdatName, string SymbolName);
 +        private static readonly bool s_largeFileBufferEnabled = IlcOptimizationExperiments.IsEnabled("large-coff-buffer");
++        private static readonly bool s_batchedWritesEnabled = IlcOptimizationExperiments.IsEnabled("coff-batched-writes");
++        private static readonly bool s_compactRelocationsEnabled = IlcOptimizationExperiments.IsEnabled("compact-coff-relocations");
++        private static readonly bool s_compactSymbolsEnabled = IlcOptimizationExperiments.IsEnabled("compact-coff-symbols");
++        private static readonly bool s_fastLongNamesEnabled = IlcOptimizationExperiments.IsEnabled("coff-fast-long-names");
 +        private static readonly bool s_preallocateCollectionsEnabled = IlcOptimizationExperiments.IsEnabled("preallocate-object-writer");
 +
 +        private sealed class SectionDefinition
@@ -538,10 +615,23 @@ index d6deb2760..5a0cafad4 100644
 +            public CoffSectionHeader Header { get; }
 +            public Stream Stream { get; }
 +            public List<CoffRelocation> Relocations { get; set; }
++            public List<CompactCoffRelocation> CompactRelocations { get; set; }
 +            public string ComdatName { get; }
 +            public string SymbolName { get; }
++
++            public int RelocationCount => s_compactRelocationsEnabled ?
++                CompactRelocations?.Count ?? 0 :
++                Relocations?.Count ?? 0;
 +        }
-@@ -87,0 +107,14 @@ public CoffObjectWriter(NodeFactory factory, ObjectWritingOptions options)
+@@ -56,0 +85 @@ private sealed record SectionDefinition(CoffSectionHeader Header, Stream Stream,
++        private readonly ChunkedList<CompactCoffSymbolRecord> _compactSymbols = new();
+@@ -58,0 +88 @@ private sealed record SectionDefinition(CoffSectionHeader Header, Stream Stream,
++        private readonly Dictionary<int, int> _sectionNumberToCompactComdatAuxRecord = new();
+@@ -59,0 +90,3 @@ private sealed record SectionDefinition(CoffSectionHeader Header, Stream Stream,
++        private long _coffRelocationCount;
++
++        private int SymbolCount => s_compactSymbolsEnabled ? _compactSymbols.Count : _symbols.Count;
+@@ -87,0 +121,89 @@ public CoffObjectWriter(NodeFactory factory, ObjectWritingOptions options)
 +        private protected override void PrepareForEmission(int markedNodeCount, int estimatedSectionCount)
 +        {
 +            if (!s_preallocateCollectionsEnabled)
@@ -551,12 +641,143 @@ index d6deb2760..5a0cafad4 100644
 +
 +            int estimatedSymbolCount = (int)Math.Min(int.MaxValue, Math.Max(16L, (long)markedNodeCount * 3 / 5));
 +            _sections.EnsureCapacity(estimatedSectionCount);
-+            _symbols.EnsureCapacity(estimatedSymbolCount);
++            if (s_compactSymbolsEnabled)
++            {
++                _compactSymbols.EnsureCapacity(estimatedSymbolCount);
++            }
++            else
++            {
++                _symbols.EnsureCapacity(estimatedSymbolCount);
++            }
 +            _sectionNumberToComdatAuxRecord.EnsureCapacity(estimatedSectionCount);
 +            IlcOptimizationExperiments.SetCounter("object-preallocated-symbol-capacity", estimatedSymbolCount);
 +        }
 +
-@@ -165 +198,6 @@ private protected override void CreateSection(ObjectNodeSection section, string
++        private void AddSymbol(
++            string name,
++            uint value,
++            uint sectionIndex,
++            CoffSymbolClass storageClass,
++            byte numberOfAuxiliaryRecords = 0)
++        {
++            if (s_compactSymbolsEnabled)
++            {
++                _compactSymbols.Add(CompactCoffSymbolRecord.CreateSymbol(
++                    name,
++                    value,
++                    sectionIndex,
++                    storageClass,
++                    numberOfAuxiliaryRecords));
++            }
++            else
++            {
++                _symbols.Add(new CoffSymbol
++                {
++                    Name = name,
++                    Value = value,
++                    SectionIndex = sectionIndex,
++                    StorageClass = storageClass,
++                    NumberOfAuxiliaryRecords = numberOfAuxiliaryRecords,
++                });
++            }
++        }
++
++        private void AddSectionSymbol(int sectionNumber, uint definingSectionIndex, CoffComdatSelect selection)
++        {
++            if (s_compactSymbolsEnabled)
++            {
++                _sectionNumberToCompactComdatAuxRecord[sectionNumber] = _compactSymbols.Count;
++                _compactSymbols.Add(CompactCoffSymbolRecord.CreateSectionSymbol(definingSectionIndex, selection));
++            }
++            else
++            {
++                var auxiliaryRecord = new CoffSectionSymbol
++                {
++                    Number = definingSectionIndex,
++                    Selection = selection,
++                };
++                _sectionNumberToComdatAuxRecord[sectionNumber] = auxiliaryRecord;
++                _symbols.Add(auxiliaryRecord);
++            }
++        }
++
++        private uint GetSymbolSectionIndex(int symbolIndex)
++        {
++            return s_compactSymbolsEnabled ?
++                _compactSymbols[symbolIndex].SectionIndex :
++                ((CoffSymbol)_symbols[symbolIndex]).SectionIndex;
++        }
++
++        private void SetSymbolValue(int symbolIndex, uint value)
++        {
++            if (s_compactSymbolsEnabled)
++            {
++                ref CompactCoffSymbolRecord symbol = ref _compactSymbols[symbolIndex];
++                symbol.Value = value;
++            }
++            else
++            {
++                ((CoffSymbol)_symbols[symbolIndex]).Value = value;
++            }
++        }
++
+@@ -128,9 +250,14 @@ private protected override void CreateSection(ObjectNodeSection section, string
+-                uint definingSectionIndex = isPrimary ? sectionIndex : ((CoffSymbol)_symbols[(int)_symbolNameToIndex[comdatName]]).SectionIndex;
+-
+-                var auxRecord = new CoffSectionSymbol
+-                {
+-                    // SizeOfRawData, NumberOfRelocations, NumberOfLineNumbers
+-                    // CheckSum will be filled later in EmitObjectFile
+-
+-                    Number = definingSectionIndex,
+-                    Selection = isPrimary ?
++                uint definingSectionIndex = isPrimary ?
++                    sectionIndex :
++                    GetSymbolSectionIndex((int)_symbolNameToIndex[comdatName]);
++
++                AddSymbol(
++                    sectionHeader.Name,
++                    value: 0,
++                    sectionIndex,
++                    CoffSymbolClass.IMAGE_SYM_CLASS_STATIC,
++                    numberOfAuxiliaryRecords: 1);
++                AddSectionSymbol(
++                    _sections.Count,
++                    definingSectionIndex,
++                    isPrimary ?
+@@ -138,13 +265 @@ private protected override void CreateSection(ObjectNodeSection section, string
+-                        CoffComdatSelect.IMAGE_COMDAT_SELECT_ASSOCIATIVE,
+-                };
+-
+-                _sectionNumberToComdatAuxRecord[_sections.Count] = auxRecord;
+-                _symbols.Add(new CoffSymbol
+-                {
+-                    Name = sectionHeader.Name,
+-                    Value = 0,
+-                    SectionIndex = sectionIndex,
+-                    StorageClass = CoffSymbolClass.IMAGE_SYM_CLASS_STATIC,
+-                    NumberOfAuxiliaryRecords = 1,
+-                });
+-                _symbols.Add(auxRecord);
++                        CoffComdatSelect.IMAGE_COMDAT_SELECT_ASSOCIATIVE);
+@@ -154,8 +269,8 @@ private protected override void CreateSection(ObjectNodeSection section, string
+-                    _symbolNameToIndex.Add(symbolName, (uint)_symbols.Count);
+-                    _symbols.Add(new CoffSymbol
+-                    {
+-                        Name = symbolName,
+-                        Value = 0,
+-                        SectionIndex = sectionIndex,
+-                        StorageClass = isPrimary ? CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL : CoffSymbolClass.IMAGE_SYM_CLASS_STATIC,
+-                    });
++                    _symbolNameToIndex.Add(symbolName, (uint)SymbolCount);
++                    AddSymbol(
++                        symbolName,
++                        value: 0,
++                        sectionIndex,
++                        isPrimary ?
++                            CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL :
++                            CoffSymbolClass.IMAGE_SYM_CLASS_STATIC);
+@@ -165 +280,6 @@ private protected override void CreateSection(ObjectNodeSection section, string
 -            _sections.Add(new SectionDefinition(sectionHeader, sectionStream, new List<CoffRelocation>(), comdatName, symbolName));
 +            _sections.Add(new SectionDefinition(
 +                sectionHeader,
@@ -564,14 +785,215 @@ index d6deb2760..5a0cafad4 100644
 +                LazyRelocationListsEnabled ? null : new List<CoffRelocation>(),
 +                comdatName,
 +                symbolName));
-@@ -279,0 +318,6 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
-+                if (coffRelocations is null)
+@@ -223 +343 @@ private protected override void EmitSymbolTable(
+-                    ((CoffSymbol)_symbols[(int)symbolIndex]).Value = (uint)symbolDefinition.Value;
++                    SetSymbolValue((int)symbolIndex, (uint)symbolDefinition.Value);
+@@ -227,8 +347,6 @@ private protected override void EmitSymbolTable(
+-                    _symbolNameToIndex.Add(symbolName, (uint)_symbols.Count);
+-                    _symbols.Add(new CoffSymbol
+-                    {
+-                        Name = symbolName,
+-                        Value = (uint)symbolDefinition.Value,
+-                        SectionIndex = (uint)(1 + symbolDefinition.SectionIndex),
+-                        StorageClass = CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL,
+-                    });
++                    _symbolNameToIndex.Add(symbolName, (uint)SymbolCount);
++                    AddSymbol(
++                        symbolName,
++                        (uint)symbolDefinition.Value,
++                        (uint)(1 + symbolDefinition.SectionIndex),
++                        CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL);
+@@ -240,6 +358,6 @@ private protected override void EmitSymbolTable(
+-                _symbolNameToIndex.Add(symbolName, (uint)_symbols.Count);
+-                _symbols.Add(new CoffSymbol
+-                {
+-                    Name = symbolName,
+-                    StorageClass = CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL,
+-                });
++                _symbolNameToIndex.Add(symbolName, (uint)SymbolCount);
++                AddSymbol(
++                    symbolName,
++                    value: 0,
++                    sectionIndex: 0,
++                    CoffSymbolClass.IMAGE_SYM_CLASS_EXTERNAL);
+@@ -264,7 +382,5 @@ private protected override void EmitSymbolTable(
+-                _symbols.Add(new CoffSymbol
+-                {
+-                    Name = "@feat.00",
+-                    StorageClass = CoffSymbolClass.IMAGE_SYM_CLASS_STATIC,
+-                    SectionIndex = uint.MaxValue, // IMAGE_SYM_ABSOLUTE
+-                    Value = (uint)feat00Flags,
+-                });
++                AddSymbol(
++                    "@feat.00",
++                    (uint)feat00Flags,
++                    uint.MaxValue, // IMAGE_SYM_ABSOLUTE
++                    CoffSymbolClass.IMAGE_SYM_CLASS_STATIC);
+@@ -279,0 +396,6 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
++                if (!s_compactRelocationsEnabled && coffRelocations is null)
 +                {
 +                    coffRelocations = new List<CoffRelocation>(relocationList.Count + 1);
 +                    _sections[sectionIndex].Relocations = coffRelocations;
 +                }
 +
-@@ -471 +515,9 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -289 +411,5 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                    coffRelocations.Add(new CoffRelocation { VirtualAddress = (uint)(relocationList.Count + 1) });
++                    AddCoffRelocation(
++                        _sections[sectionIndex],
++                        (uint)(relocationList.Count + 1),
++                        symbolTableIndex: 0,
++                        type: 0);
+@@ -292 +418 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                switch (_machine)
++                foreach (SymbolicRelocation relocation in relocationList)
+@@ -294,2 +420,3 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                    case Machine.I386:
+-                        foreach (var relocation in relocationList)
++                    CoffRelocationType type = _machine switch
++                    {
++                        Machine.I386 => relocation.Type switch
+@@ -297,21 +424,10 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                            coffRelocations.Add(new CoffRelocation
+-                            {
+-                                VirtualAddress = (uint)relocation.Offset,
+-                                SymbolTableIndex = _symbolNameToIndex[relocation.SymbolName],
+-                                Type = relocation.Type switch
+-                                {
+-                                    IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_I386_DIR32NB,
+-                                    IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_I386_DIR32NB,
+-                                    IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_I386_DIR32,
+-                                    IMAGE_REL_BASED_REL32 => IMAGE_REL_I386_REL32,
+-                                    IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_I386_REL32,
+-                                    IMAGE_REL_SECREL => IMAGE_REL_I386_SECREL,
+-                                    IMAGE_REL_SECTION => IMAGE_REL_I386_SECTION,
+-                                    _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
+-                                },
+-                            });
+-                        }
+-                        break;
+-
+-                    case Machine.Amd64:
+-                        foreach (var relocation in relocationList)
++                            IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_I386_DIR32NB,
++                            IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_I386_DIR32NB,
++                            IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_I386_DIR32,
++                            IMAGE_REL_BASED_REL32 => IMAGE_REL_I386_REL32,
++                            IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_I386_REL32,
++                            IMAGE_REL_SECREL => IMAGE_REL_I386_SECREL,
++                            IMAGE_REL_SECTION => IMAGE_REL_I386_SECTION,
++                            _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
++                        },
++                        Machine.Amd64 => relocation.Type switch
+@@ -319,22 +435,11 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                            coffRelocations.Add(new CoffRelocation
+-                            {
+-                                VirtualAddress = (uint)relocation.Offset,
+-                                SymbolTableIndex = _symbolNameToIndex[relocation.SymbolName],
+-                                Type = relocation.Type switch
+-                                {
+-                                    IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_AMD64_ADDR32NB,
+-                                    IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_AMD64_ADDR32NB,
+-                                    IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_AMD64_ADDR32,
+-                                    IMAGE_REL_BASED_DIR64 => IMAGE_REL_AMD64_ADDR64,
+-                                    IMAGE_REL_BASED_REL32 => IMAGE_REL_AMD64_REL32,
+-                                    IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_AMD64_REL32,
+-                                    IMAGE_REL_SECREL => IMAGE_REL_AMD64_SECREL,
+-                                    IMAGE_REL_SECTION => IMAGE_REL_AMD64_SECTION,
+-                                    _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
+-                                },
+-                            });
+-                        }
+-                        break;
+-
+-                    case Machine.Arm64:
+-                        foreach (var relocation in relocationList)
++                            IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_AMD64_ADDR32NB,
++                            IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_AMD64_ADDR32NB,
++                            IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_AMD64_ADDR32,
++                            IMAGE_REL_BASED_DIR64 => IMAGE_REL_AMD64_ADDR64,
++                            IMAGE_REL_BASED_REL32 => IMAGE_REL_AMD64_REL32,
++                            IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_AMD64_REL32,
++                            IMAGE_REL_SECREL => IMAGE_REL_AMD64_SECREL,
++                            IMAGE_REL_SECTION => IMAGE_REL_AMD64_SECTION,
++                            _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
++                        },
++                        Machine.Arm64 => relocation.Type switch
+@@ -342,27 +447,23 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+-                            coffRelocations.Add(new CoffRelocation
+-                            {
+-                                VirtualAddress = (uint)relocation.Offset,
+-                                SymbolTableIndex = _symbolNameToIndex[relocation.SymbolName],
+-                                Type = relocation.Type switch
+-                                {
+-                                    IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_ARM64_ADDR32NB,
+-                                    IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_ARM64_ADDR32NB,
+-                                    IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_ARM64_ADDR32,
+-                                    IMAGE_REL_BASED_DIR64 => IMAGE_REL_ARM64_ADDR64,
+-                                    IMAGE_REL_BASED_REL32 => IMAGE_REL_ARM64_REL32,
+-                                    IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_ARM64_REL32,
+-                                    IMAGE_REL_BASED_ARM64_BRANCH26 => IMAGE_REL_ARM64_BRANCH26,
+-                                    IMAGE_REL_BASED_ARM64_PAGEBASE_REL21 => IMAGE_REL_ARM64_PAGEBASE_REL21,
+-                                    IMAGE_REL_BASED_ARM64_PAGEOFFSET_12A => IMAGE_REL_ARM64_PAGEOFFSET_12A,
+-                                    IMAGE_REL_ARM64_TLS_SECREL_HIGH12A => IMAGE_REL_ARM64_SECREL_HIGH12A,
+-                                    IMAGE_REL_ARM64_TLS_SECREL_LOW12A => IMAGE_REL_ARM64_SECREL_LOW12A,
+-                                    IMAGE_REL_SECREL => IMAGE_REL_ARM64_SECREL,
+-                                    IMAGE_REL_SECTION => IMAGE_REL_ARM64_SECTION,
+-                                    _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
+-                                },
+-                            });
+-                        }
+-                        break;
+-
+-                    default:
+-                        throw new NotSupportedException("Unsupported architecture");
++                            IMAGE_REL_BASED_ABSOLUTE => IMAGE_REL_ARM64_ADDR32NB,
++                            IMAGE_REL_BASED_ADDR32NB => IMAGE_REL_ARM64_ADDR32NB,
++                            IMAGE_REL_BASED_HIGHLOW => IMAGE_REL_ARM64_ADDR32,
++                            IMAGE_REL_BASED_DIR64 => IMAGE_REL_ARM64_ADDR64,
++                            IMAGE_REL_BASED_REL32 => IMAGE_REL_ARM64_REL32,
++                            IMAGE_REL_BASED_RELPTR32 => IMAGE_REL_ARM64_REL32,
++                            IMAGE_REL_BASED_ARM64_BRANCH26 => IMAGE_REL_ARM64_BRANCH26,
++                            IMAGE_REL_BASED_ARM64_PAGEBASE_REL21 => IMAGE_REL_ARM64_PAGEBASE_REL21,
++                            IMAGE_REL_BASED_ARM64_PAGEOFFSET_12A => IMAGE_REL_ARM64_PAGEOFFSET_12A,
++                            IMAGE_REL_ARM64_TLS_SECREL_HIGH12A => IMAGE_REL_ARM64_SECREL_HIGH12A,
++                            IMAGE_REL_ARM64_TLS_SECREL_LOW12A => IMAGE_REL_ARM64_SECREL_LOW12A,
++                            IMAGE_REL_SECREL => IMAGE_REL_ARM64_SECREL,
++                            IMAGE_REL_SECTION => IMAGE_REL_ARM64_SECTION,
++                            _ => throw new NotSupportedException($"Unsupported relocation: {relocation.Type}")
++                        },
++                        _ => throw new NotSupportedException("Unsupported architecture"),
++                    };
++
++                    AddCoffRelocation(
++                        _sections[sectionIndex],
++                        (uint)relocation.Offset,
++                        _symbolNameToIndex[relocation.SymbolName],
++                        type);
+@@ -372,0 +474,23 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
++        private void AddCoffRelocation(
++            SectionDefinition section,
++            uint virtualAddress,
++            uint symbolTableIndex,
++            CoffRelocationType type)
++        {
++            if (s_compactRelocationsEnabled)
++            {
++                section.CompactRelocations ??= new List<CompactCoffRelocation>();
++                section.CompactRelocations.Add(new CompactCoffRelocation(virtualAddress, symbolTableIndex, type));
++            }
++            else
++            {
++                section.Relocations.Add(new CoffRelocation
++                {
++                    VirtualAddress = virtualAddress,
++                    SymbolTableIndex = symbolTableIndex,
++                    Type = type,
++                });
++            }
++            _coffRelocationCount++;
++        }
++
+@@ -471 +595,11 @@ private protected override void EmitObjectFile(string objectFilePath)
 -            using var outputFileStream = new FileStream(objectFilePath, FileMode.Create);
 +            using FileStream outputFileStream = s_largeFileBufferEnabled ?
 +                new FileStream(
@@ -582,41 +1004,509 @@ index d6deb2760..5a0cafad4 100644
 +                    1024 * 1024,
 +                    FileOptions.SequentialScan) :
 +                new FileStream(objectFilePath, FileMode.Create);
-@@ -480,0 +533 @@ private protected override void EmitObjectFile(string objectFilePath)
++            using var batchedOutput = s_batchedWritesEnabled ? new BufferedOutputStream(outputFileStream) : null;
++            Stream outputStream = batchedOutput is not null ? batchedOutput : outputFileStream;
+@@ -477 +611 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                NumberOfSymbols = (uint)_symbols.Count,
++                NumberOfSymbols = (uint)SymbolCount,
+@@ -480,0 +615 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            long layoutStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -499,2 +552,3 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -499,2 +634,3 @@ private protected override void EmitObjectFile(string objectFilePath)
 -                section.Header.PointerToRelocations = section.Relocations.Count > 0 ? dataOffset : 0;
 -                dataOffset += (uint)(section.Relocations.Count * CoffRelocation.Size);
-+                int relocationCount = section.Relocations?.Count ?? 0;
++                int relocationCount = section.RelocationCount;
 +                section.Header.PointerToRelocations = relocationCount > 0 ? dataOffset : 0;
 +                dataOffset += (uint)(relocationCount * CoffRelocation.Size);
-@@ -505,0 +560 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -505,0 +642 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-file-layout", layoutStart);
-@@ -507,0 +563 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -508 +645,2 @@ private protected override void EmitObjectFile(string objectFilePath)
+-            coffHeader.Write(outputFileStream);
 +            long headerWriteStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -531,0 +588 @@ private protected override void EmitObjectFile(string objectFilePath)
++            coffHeader.Write(outputStream);
+@@ -514 +652 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                section.Header.Write(outputFileStream, stringTable);
++                section.Header.Write(outputStream, stringTable);
+@@ -520 +658 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                if (_sectionNumberToComdatAuxRecord.TryGetValue(sectionIndex, out var auxRecord))
++                if (s_compactSymbolsEnabled)
+@@ -522,3 +660,16 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    auxRecord.SizeOfRawData = section.Header.SizeOfRawData;
+-                    auxRecord.NumberOfRelocations = section.Header.NumberOfRelocations;
+-                    auxRecord.NumberOfLineNumbers = section.Header.NumberOfLineNumbers;
++                    if (_sectionNumberToCompactComdatAuxRecord.TryGetValue(sectionIndex, out int auxiliarySymbolIndex))
++                    {
++                        ref CompactCoffSymbolRecord auxiliaryRecord = ref _compactSymbols[auxiliarySymbolIndex];
++                        auxiliaryRecord.SizeOfRawData = section.Header.SizeOfRawData;
++                        auxiliaryRecord.NumberOfRelocations = section.Header.NumberOfRelocations;
++                        auxiliaryRecord.NumberOfLineNumbers = section.Header.NumberOfLineNumbers;
++
++                        section.Stream.Position = 0;
++                        auxiliaryRecord.CheckSum = JamCrc32.CalculateChecksum(section.Stream);
++                    }
++                }
++                else if (_sectionNumberToComdatAuxRecord.TryGetValue(sectionIndex, out var auxiliaryRecord))
++                {
++                    auxiliaryRecord.SizeOfRawData = section.Header.SizeOfRawData;
++                    auxiliaryRecord.NumberOfRelocations = section.Header.NumberOfRelocations;
++                    auxiliaryRecord.NumberOfLineNumbers = section.Header.NumberOfLineNumbers;
+@@ -527 +678 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    auxRecord.CheckSum = JamCrc32.CalculateChecksum(section.Stream);
++                    auxiliaryRecord.CheckSum = JamCrc32.CalculateChecksum(section.Stream);
+@@ -531,0 +683 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-header-write", headerWriteStart);
-@@ -533,0 +591 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -533,0 +686 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            long contentWriteStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -543 +601 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -538 +691 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    Debug.Assert(outputFileStream.Position == section.Header.PointerToRawData);
++                    Debug.Assert(outputStream.Position == section.Header.PointerToRawData);
+@@ -540 +693 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    section.Stream.CopyTo(outputFileStream);
++                    section.Stream.CopyTo(outputStream);
+@@ -543 +696 @@ private protected override void EmitObjectFile(string objectFilePath)
 -                if (section.Relocations.Count > 0)
-+                if (section.Relocations is not null)
-@@ -550,0 +609 @@ private protected override void EmitObjectFile(string objectFilePath)
++                if (s_compactRelocationsEnabled)
+@@ -545 +698 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    foreach (var relocation in section.Relocations)
++                    if (section.CompactRelocations is not null)
+@@ -547 +700,11 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                        relocation.Write(outputFileStream);
++                        foreach (CompactCoffRelocation relocation in section.CompactRelocations)
++                        {
++                            relocation.Write(outputStream);
++                        }
++                    }
++                }
++                else if (section.Relocations is not null)
++                {
++                    foreach (CoffRelocation relocation in section.Relocations)
++                    {
++                        relocation.Write(outputStream);
+@@ -550,0 +714 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-content-write", contentWriteStart);
-@@ -552,0 +612 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -553 +717,12 @@ private protected override void EmitObjectFile(string objectFilePath)
+-            foreach (var coffSymbolRecord in _symbols)
 +            long stringReserveStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -559,0 +620 @@ private protected override void EmitObjectFile(string objectFilePath)
++            if (s_compactSymbolsEnabled)
++            {
++                foreach (ref readonly CompactCoffSymbolRecord symbol in _compactSymbols)
++                {
++                    if (!symbol.IsAuxiliary)
++                    {
++                        stringTable.ReserveString(symbol.Name);
++                    }
++                }
++            }
++            else
+@@ -555 +730 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                if (coffSymbolRecord is CoffSymbol coffSymbol)
++                foreach (CoffSymbolRecord symbolRecord in _symbols)
+@@ -557 +732,4 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    stringTable.ReserveString(coffSymbol.Name);
++                    if (symbolRecord is CoffSymbol symbol)
++                    {
++                        stringTable.ReserveString(symbol.Name);
++                    }
+@@ -559,0 +738 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-string-reserve", stringReserveStart);
-@@ -561,0 +623 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -562,2 +741,10 @@ private protected override void EmitObjectFile(string objectFilePath)
+-            Debug.Assert(outputFileStream.Position == coffHeader.PointerToSymbolTable);
+-            foreach (var coffSymbolRecord in _symbols)
 +            long symbolWriteStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -566,0 +629 @@ private protected override void EmitObjectFile(string objectFilePath)
++            Debug.Assert(outputStream.Position == coffHeader.PointerToSymbolTable);
++            if (s_compactSymbolsEnabled)
++            {
++                foreach (ref readonly CompactCoffSymbolRecord symbol in _compactSymbols)
++                {
++                    symbol.Write(outputStream, stringTable, coffHeader.IsBigObj);
++                }
++            }
++            else
+@@ -565 +752,4 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                coffSymbolRecord.Write(outputFileStream, stringTable, coffHeader.IsBigObj);
++                foreach (CoffSymbolRecord symbolRecord in _symbols)
++                {
++                    symbolRecord.Write(outputStream, stringTable, coffHeader.IsBigObj);
++                }
+@@ -566,0 +757 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-symbol-write", symbolWriteStart);
-@@ -568,0 +632 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -569 +760,18 @@ private protected override void EmitObjectFile(string objectFilePath)
+-            stringTable.Write(outputFileStream);
 +            long stringWriteStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -569,0 +634,3 @@ private protected override void EmitObjectFile(string objectFilePath)
++            stringTable.Write(outputStream);
++            outputStream.Flush();
 +            IlcOptimizationExperiments.RecordPhase("coff-string-write", stringWriteStart);
 +            IlcOptimizationExperiments.SetCounter("coff-section-count", _sections.Count);
-+            IlcOptimizationExperiments.SetCounter("coff-symbol-record-count", _symbols.Count);
++            IlcOptimizationExperiments.SetCounter("coff-relocation-record-count", _coffRelocationCount);
++            IlcOptimizationExperiments.SetCounter("coff-symbol-record-count", SymbolCount);
++            if (s_compactSymbolsEnabled)
++            {
++                IlcOptimizationExperiments.SetCounter("coff-symbol-chunk-count", _compactSymbols.ChunkCount);
++            }
++            if (batchedOutput is not null)
++            {
++                IlcOptimizationExperiments.SetCounter("coff-batched-input-write-count", batchedOutput.InputWriteCount);
++                IlcOptimizationExperiments.SetCounter("coff-batched-output-write-count", batchedOutput.OutputWriteCount);
++                IlcOptimizationExperiments.SetCounter("coff-batched-copied-bytes", batchedOutput.CopiedBytes);
++                IlcOptimizationExperiments.SetCounter("coff-batched-direct-bytes", batchedOutput.DirectBytes);
++            }
+@@ -722 +930 @@ private struct CoffHeader
+-            public void Write(FileStream stream)
++            public void Write(Stream stream)
+@@ -787 +995 @@ private sealed class CoffSectionHeader
+-            public void Write(FileStream stream, CoffStringTable stringTable)
++            public void Write(Stream stream, CoffStringTable stringTable)
+@@ -791 +999,3 @@ public void Write(FileStream stream, CoffStringTable stringTable)
+-                var nameBytes = Encoding.UTF8.GetByteCount(Name);
++                int nameBytes = s_fastLongNamesEnabled && Name.Length > NameSize ?
++                    NameSize + 1 :
++                    Encoding.UTF8.GetByteCount(Name);
+@@ -900 +1110 @@ private sealed class CoffRelocation
+-            public void Write(FileStream stream)
++            public void Write(Stream stream)
+@@ -911,0 +1122,23 @@ public void Write(FileStream stream)
++        private readonly struct CompactCoffRelocation
++        {
++            public CompactCoffRelocation(uint virtualAddress, uint symbolTableIndex, CoffRelocationType type)
++            {
++                VirtualAddress = virtualAddress;
++                SymbolTableIndex = symbolTableIndex;
++                Type = type;
++            }
++
++            public uint VirtualAddress { get; }
++            public uint SymbolTableIndex { get; }
++            public CoffRelocationType Type { get; }
++
++            public void Write(Stream stream)
++            {
++                Span<byte> buffer = stackalloc byte[CoffRelocation.Size];
++                BinaryPrimitives.WriteUInt32LittleEndian(buffer, VirtualAddress);
++                BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(4), SymbolTableIndex);
++                BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(8), (ushort)Type);
++                stream.Write(buffer);
++            }
++        }
++
+@@ -955 +1188,3 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
+-                int nameBytes = Encoding.UTF8.GetByteCount(Name);
++                int nameBytes = s_fastLongNamesEnabled && Name.Length > NameSize ?
++                    NameSize + 1 :
++                    Encoding.UTF8.GetByteCount(Name);
+@@ -1040,0 +1276,216 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
++        private struct CompactCoffSymbolRecord
++        {
++            private const int NameSize = 8;
++            private const int RegularSymbolSize = 18;
++            private const int BigSymbolSize = 20;
++            private const int RegularSectionSize = 18;
++            private const int BigSectionSize = 20;
++
++            public string Name;
++            public uint Value;
++            public uint SectionIndex;
++            public uint Number;
++            public ushort Type;
++            public ushort NumberOfLineNumbers;
++            public CoffSymbolClass StorageClass;
++            public byte NumberOfAuxiliaryRecords;
++
++            public readonly bool IsAuxiliary => Name is null;
++
++            public uint SizeOfRawData
++            {
++                readonly get => Value;
++                set => Value = value;
++            }
++
++            public ushort NumberOfRelocations
++            {
++                readonly get => Type;
++                set => Type = value;
++            }
++
++            public uint CheckSum
++            {
++                readonly get => SectionIndex;
++                set => SectionIndex = value;
++            }
++
++            public CoffComdatSelect Selection
++            {
++                readonly get => (CoffComdatSelect)NumberOfAuxiliaryRecords;
++                set => NumberOfAuxiliaryRecords = (byte)value;
++            }
++
++            public static CompactCoffSymbolRecord CreateSymbol(
++                string name,
++                uint value,
++                uint sectionIndex,
++                CoffSymbolClass storageClass,
++                byte numberOfAuxiliaryRecords)
++            {
++                return new CompactCoffSymbolRecord
++                {
++                    Name = name,
++                    Value = value,
++                    SectionIndex = sectionIndex,
++                    StorageClass = storageClass,
++                    NumberOfAuxiliaryRecords = numberOfAuxiliaryRecords,
++                };
++            }
++
++            public static CompactCoffSymbolRecord CreateSectionSymbol(uint number, CoffComdatSelect selection)
++            {
++                return new CompactCoffSymbolRecord
++                {
++                    Number = number,
++                    Selection = selection,
++                };
++            }
++
++            public readonly void Write(Stream stream, CoffStringTable stringTable, bool isBigObj)
++            {
++                if (IsAuxiliary)
++                {
++                    WriteSectionSymbol(stream, isBigObj);
++                }
++                else
++                {
++                    WriteSymbol(stream, stringTable, isBigObj);
++                }
++            }
++
++            private readonly void WriteSymbol(Stream stream, CoffStringTable stringTable, bool isBigObj)
++            {
++                Span<byte> buffer = stackalloc byte[isBigObj ? BigSymbolSize : RegularSymbolSize];
++
++                int nameBytes = s_fastLongNamesEnabled && Name.Length > NameSize ?
++                    NameSize + 1 :
++                    Encoding.UTF8.GetByteCount(Name);
++                if (nameBytes <= NameSize)
++                {
++                    Encoding.UTF8.GetBytes(Name, buffer);
++                    if (nameBytes < NameSize)
++                    {
++                        buffer.Slice(nameBytes, NameSize - nameBytes).Clear();
++                    }
++                }
++                else
++                {
++                    BinaryPrimitives.WriteUInt32LittleEndian(buffer, 0);
++                    BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(4, 4), stringTable.GetStringOffset(Name));
++                }
++
++                BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(NameSize), Value);
++                int sliceIndex;
++                if (isBigObj)
++                {
++                    BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(NameSize + 4), SectionIndex);
++                    sliceIndex = NameSize + 8;
++                }
++                else
++                {
++                    Debug.Assert(SectionIndex == uint.MaxValue || SectionIndex < ushort.MaxValue);
++                    BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(NameSize + 4), (ushort)SectionIndex);
++                    sliceIndex = NameSize + 6;
++                }
++                BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(sliceIndex), Type);
++                buffer[sliceIndex + 2] = (byte)StorageClass;
++                buffer[sliceIndex + 3] = NumberOfAuxiliaryRecords;
++
++                stream.Write(buffer);
++            }
++
++            private readonly void WriteSectionSymbol(Stream stream, bool isBigObj)
++            {
++                Span<byte> buffer = stackalloc byte[isBigObj ? BigSectionSize : RegularSectionSize];
++
++                buffer.Clear();
++                BinaryPrimitives.WriteUInt32LittleEndian(buffer, SizeOfRawData);
++                BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(4), NumberOfRelocations);
++                BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(6), NumberOfLineNumbers);
++                BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(8), CheckSum);
++                BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(12), (ushort)Number);
++                buffer[14] = (byte)Selection;
++                if (isBigObj)
++                {
++                    BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(16), (ushort)(Number >> 16));
++                }
++
++                stream.Write(buffer);
++            }
++        }
++
++        private sealed class ChunkedList<T>
++        {
++            private const int ChunkShift = 16;
++            private const int ChunkSize = 1 << ChunkShift;
++            private const int ChunkMask = ChunkSize - 1;
++
++            private readonly List<T[]> _chunks = new();
++
++            public int Count { get; private set; }
++            public int ChunkCount => _chunks.Count;
++
++            public ref T this[int index]
++            {
++                get
++                {
++                    Debug.Assert((uint)index < (uint)Count);
++                    return ref _chunks[index >> ChunkShift][index & ChunkMask];
++                }
++            }
++
++            public void Add(T item)
++            {
++                int index = Count;
++                if ((index & ChunkMask) == 0)
++                {
++                    _chunks.Add(new T[ChunkSize]);
++                }
++
++                _chunks[index >> ChunkShift][index & ChunkMask] = item;
++                Count = index + 1;
++            }
++
++            public void EnsureCapacity(int capacity)
++            {
++                _chunks.EnsureCapacity((capacity + ChunkMask) >> ChunkShift);
++            }
++
++            public Enumerator GetEnumerator()
++            {
++                return new Enumerator(this);
++            }
++
++            public struct Enumerator
++            {
++                private readonly ChunkedList<T> _list;
++                private int _index;
++                private T[] _chunk;
++
++                public Enumerator(ChunkedList<T> list)
++                {
++                    _list = list;
++                    _index = -1;
++                    _chunk = null;
++                }
++
++                public readonly ref T Current => ref _chunk[_index & ChunkMask];
++
++                public bool MoveNext()
++                {
++                    int index = ++_index;
++                    if (index >= _list.Count)
++                    {
++                        return false;
++                    }
++                    if ((index & ChunkMask) == 0)
++                    {
++                        _chunk = _list._chunks[index >> ChunkShift];
++                    }
++
++                    return true;
++                }
++            }
++        }
++
+@@ -1050 +1501 @@ private sealed class CoffStringTable : StringTableBuilder
+-            public new void Write(FileStream stream)
++            public new void Write(Stream stream)
+@@ -1058,0 +1510,94 @@ private sealed class CoffStringTable : StringTableBuilder
++        private sealed class BufferedOutputStream : Stream
++        {
++            private const int BufferSize = 1024 * 1024;
++
++            private readonly Stream _output;
++            private byte[] _buffer;
++            private int _bufferedCount;
++            private long _position;
++
++            public long InputWriteCount { get; private set; }
++            public long OutputWriteCount { get; private set; }
++            public long CopiedBytes { get; private set; }
++            public long DirectBytes { get; private set; }
++
++            public BufferedOutputStream(Stream output)
++            {
++                _output = output;
++                _buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
++                _position = output.Position;
++            }
++
++            public override bool CanRead => false;
++            public override bool CanSeek => false;
++            public override bool CanWrite => true;
++            public override long Length => _position;
++
++            public override long Position
++            {
++                get => _position;
++                set => throw new NotSupportedException();
++            }
++
++            public override void Flush()
++            {
++                FlushBuffer();
++                _output.Flush();
++            }
++
++            public override void Write(byte[] buffer, int offset, int count)
++            {
++                Write(buffer.AsSpan(offset, count));
++            }
++
++            public override void Write(ReadOnlySpan<byte> buffer)
++            {
++                InputWriteCount++;
++                _position += buffer.Length;
++                if (buffer.Length >= _buffer.Length)
++                {
++                    FlushBuffer();
++                    _output.Write(buffer);
++                    OutputWriteCount++;
++                    DirectBytes += buffer.Length;
++                    return;
++                }
++
++                if (buffer.Length > _buffer.Length - _bufferedCount)
++                {
++                    FlushBuffer();
++                }
++
++                buffer.CopyTo(_buffer.AsSpan(_bufferedCount));
++                _bufferedCount += buffer.Length;
++                CopiedBytes += buffer.Length;
++            }
++
++            protected override void Dispose(bool disposing)
++            {
++                if (disposing && _buffer is not null)
++                {
++                    FlushBuffer();
++                    ArrayPool<byte>.Shared.Return(_buffer);
++                    _buffer = null;
++                }
++                base.Dispose(disposing);
++            }
++
++            private void FlushBuffer()
++            {
++                if (_bufferedCount == 0)
++                {
++                    return;
++                }
++
++                _output.Write(_buffer, 0, _bufferedCount);
++                OutputWriteCount++;
++                _bufferedCount = 0;
++            }
++
++            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
++            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
++            public override void SetLength(long value) => throw new NotSupportedException();
++        }
++
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
 index 6db2bc20b..f6281bfe7 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
@@ -832,7 +1722,7 @@ index 9ae566487..f16c618c6 100644
 -                    ReadOnlySpan<byte> currentBuffer = _sectionData._buffers[_bufferIndex].Span.Slice(_bufferPosition);
 +                    ReadOnlySpan<byte> currentBuffer = _sectionData.GetBuffer(_bufferIndex).Span.Slice(_bufferPosition);
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
-index 81f7315d2..5ef65af0e 100644
+index 81f7315d2..5c657f44d 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
 @@ -11,0 +12,2 @@
@@ -845,6 +1735,9 @@ index 81f7315d2..5ef65af0e 100644
 +        private readonly HashSet<string> _reservedStringsHash = s_hashSetReserveEnabled ?
 +            new HashSet<string>(StringComparer.Ordinal) :
 +            null;
+@@ -20 +27 @@ internal class StringTableBuilder
+-        public void Write(FileStream stream)
++        public void Write(Stream stream)
 @@ -39 +46,8 @@ public void ReserveString(string text)
 -                _reservedStrings.Add(text);
 +                if (s_hashSetReserveEnabled)
@@ -888,20 +1781,93 @@ index 862404c49..814e4340e 100644
 @@ -494,0 +495 @@
 +    <Compile Include="Compiler\CompilerProfile.cs" />
 diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
-index e7f7503bb..dd0596626 100644
+index e7f7503bb..288c61de6 100644
 --- a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
-@@ -29,0 +30,4 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
+@@ -29,0 +30,5 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
 +        private static readonly bool s_conditionalRemoveEnabled = IlcOptimizationExperiments.IsEnabled("conditional-remove");
++        private static readonly bool s_conditionalSingleBucketEnabled = IlcOptimizationExperiments.IsEnabled("conditional-single-bucket");
 +        private static readonly bool s_deferredPhaseListsEnabled = IlcOptimizationExperiments.IsEnabled("deferred-phase-lists");
 +        private static readonly bool s_filteredResultSortEnabled = IlcOptimizationExperiments.IsEnabled("filtered-result-sort");
 +
-@@ -37,0 +42,2 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
+@@ -37,0 +43,2 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
 +        private List<List<DependencyNodeCore<DependencyContextType>>> _deferredStaticDependenciesByPhase = new List<List<DependencyNodeCore<DependencyContextType>>>();
 +        private int _deferredStaticDependencyPhaseCount;
-@@ -43,0 +50 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
+@@ -42,0 +50,2 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
++        private Dictionary<DependencyNodeCore<DependencyContextType>, ConditionalDependencyBucket> _conditionalDependencyBuckets =
++            new Dictionary<DependencyNodeCore<DependencyContextType>, ConditionalDependencyBucket>();
+@@ -43,0 +53,36 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
 +        private long _deferredNodeCount;
-@@ -227 +234,17 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
++        private long _conditionalBucketCount;
++        private long _conditionalBucketPromotionCount;
++
++        private struct ConditionalDependencyBucket
++        {
++            public ConditionalDependencyBucket(DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry entry)
++            {
++                Single = entry;
++                Overflow = null;
++            }
++
++            public DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry Single;
++            public HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry> Overflow;
++
++            public void Add(DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry entry, ref long promotionCount)
++            {
++                if (Overflow is null)
++                {
++                    if (Single.Equals(entry))
++                    {
++                        return;
++                    }
++
++                    Overflow = new HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry>
++                    {
++                        Single,
++                        entry,
++                    };
++                    promotionCount++;
++                    return;
++                }
++
++                Overflow.Add(entry);
++            }
++        }
+@@ -201,6 +245,0 @@ private void GetStaticDependenciesImpl(DependencyNodeCore<DependencyContextType>
+-                        HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry> storedDependencySet;
+-                        if (!_conditional_dependency_store.TryGetValue(dependency.OtherReasonNode, out storedDependencySet))
+-                        {
+-                            storedDependencySet = new HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry>();
+-                            _conditional_dependency_store.Add(dependency.OtherReasonNode, storedDependencySet);
+-                        }
+@@ -210 +249,25 @@ private void GetStaticDependenciesImpl(DependencyNodeCore<DependencyContextType>
+-                        storedDependencySet.Add(conditionalDependencyStoreEntry);
++                        if (s_conditionalSingleBucketEnabled)
++                        {
++                            if (_conditionalDependencyBuckets.TryGetValue(dependency.OtherReasonNode, out ConditionalDependencyBucket bucket))
++                            {
++                                bucket.Add(conditionalDependencyStoreEntry, ref _conditionalBucketPromotionCount);
++                                _conditionalDependencyBuckets[dependency.OtherReasonNode] = bucket;
++                            }
++                            else
++                            {
++                                _conditionalDependencyBuckets.Add(
++                                    dependency.OtherReasonNode,
++                                    new ConditionalDependencyBucket(conditionalDependencyStoreEntry));
++                                _conditionalBucketCount++;
++                            }
++                        }
++                        else
++                        {
++                            HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry> storedDependencySet;
++                            if (!_conditional_dependency_store.TryGetValue(dependency.OtherReasonNode, out storedDependencySet))
++                            {
++                                storedDependencySet = new HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry>();
++                                _conditional_dependency_store.Add(dependency.OtherReasonNode, storedDependencySet);
++                            }
++                            storedDependencySet.Add(conditionalDependencyStoreEntry);
++                        }
+@@ -227 +290,17 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
 -                if (!_deferredStaticDependencies.TryGetValue(dependencyPhase, out var deferredPerPhaseDependencies))
 +                List<DependencyNodeCore<DependencyContextType>> deferredPerPhaseDependencies;
 +                if (s_deferredPhaseListsEnabled)
@@ -920,25 +1886,55 @@ index e7f7503bb..dd0596626 100644
 +                    }
 +                }
 +                else if (!_deferredStaticDependencies.TryGetValue(dependencyPhase, out deferredPerPhaseDependencies))
-@@ -232,0 +256 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
+@@ -232,0 +312 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
 +                _deferredNodeCount++;
-@@ -269 +293,4 @@ private void ProcessMarkStack()
+@@ -268,2 +348 @@ private void ProcessMarkStack()
+-                    HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry> storedDependencySet;
 -                    if (_conditional_dependency_store.TryGetValue(currentNode, out storedDependencySet))
-+                    bool hasStoredDependencies = s_conditionalRemoveEnabled ?
-+                        _conditional_dependency_store.Remove(currentNode, out storedDependencySet) :
-+                        _conditional_dependency_store.TryGetValue(currentNode, out storedDependencySet);
-+                    if (hasStoredDependencies)
-@@ -276 +303,4 @@ private void ProcessMarkStack()
--                        _conditional_dependency_store.Remove(currentNode);
-+                        if (!s_conditionalRemoveEnabled)
-+                        {
-+                            _conditional_dependency_store.Remove(currentNode);
++                    if (s_conditionalSingleBucketEnabled)
+@@ -271 +350 @@ private void ProcessMarkStack()
+-                        foreach (DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry newlySatisfiedDependency in storedDependencySet)
++                        if (_conditionalDependencyBuckets.Remove(currentNode, out ConditionalDependencyBucket bucket))
+@@ -273 +352,30 @@ private void ProcessMarkStack()
+-                            AddToMarkStack(newlySatisfiedDependency.Node, newlySatisfiedDependency.Reason, newlySatisfiedDependency.OtherReasonNode, currentNode);
++                            if (bucket.Overflow is null)
++                            {
++                                AddToMarkStack(bucket.Single.Node, bucket.Single.Reason, bucket.Single.OtherReasonNode, currentNode);
++                            }
++                            else
++                            {
++                                foreach (DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry newlySatisfiedDependency in bucket.Overflow)
++                                {
++                                    AddToMarkStack(newlySatisfiedDependency.Node, newlySatisfiedDependency.Reason, newlySatisfiedDependency.OtherReasonNode, currentNode);
++                                }
++                            }
 +                        }
-@@ -305,0 +336 @@ public override void ComputeMarkedNodes()
++                    }
++                    else
++                    {
++                        HashSet<DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry> storedDependencySet;
++                        bool hasStoredDependencies = s_conditionalRemoveEnabled ?
++                            _conditional_dependency_store.Remove(currentNode, out storedDependencySet) :
++                            _conditional_dependency_store.TryGetValue(currentNode, out storedDependencySet);
++                        if (hasStoredDependencies)
++                        {
++                            foreach (DependencyNodeCore<DependencyContextType>.CombinedDependencyListEntry newlySatisfiedDependency in storedDependencySet)
++                            {
++                                AddToMarkStack(newlySatisfiedDependency.Node, newlySatisfiedDependency.Reason, newlySatisfiedDependency.OtherReasonNode, currentNode);
++                            }
++
++                            if (!s_conditionalRemoveEnabled)
++                            {
++                                _conditional_dependency_store.Remove(currentNode);
++                            }
+@@ -275,2 +382,0 @@ private void ProcessMarkStack()
+-
+-                        _conditional_dependency_store.Remove(currentNode);
+@@ -305,0 +412 @@ public override void ComputeMarkedNodes()
 +                    long markStackStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -309,0 +341 @@ public override void ComputeMarkedNodes()
+@@ -309,0 +417 @@ public override void ComputeMarkedNodes()
 +                    IlcOptimizationExperiments.RecordPhase("graph-mark-stack", markStackStart);
-@@ -312 +344,12 @@ public override void ComputeMarkedNodes()
+@@ -312 +420,12 @@ public override void ComputeMarkedNodes()
 -                    _deferredStaticDependencies.TryGetValue(_currentDependencyPhase, out var deferredDependenciesInCurrentPhase);
 +                    List<DependencyNodeCore<DependencyContextType>> deferredDependenciesInCurrentPhase;
 +                    if (s_deferredPhaseListsEnabled)
@@ -952,11 +1948,11 @@ index e7f7503bb..dd0596626 100644
 +                    {
 +                        _deferredStaticDependencies.TryGetValue(_currentDependencyPhase, out deferredDependenciesInCurrentPhase);
 +                    }
-@@ -315,0 +359 @@ public override void ComputeMarkedNodes()
+@@ -315,0 +435 @@ public override void ComputeMarkedNodes()
 +                        long deferredStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -323,0 +368 @@ public override void ComputeMarkedNodes()
+@@ -323,0 +444 @@ public override void ComputeMarkedNodes()
 +                        IlcOptimizationExperiments.RecordPhase("graph-deferred-compute", deferredStart);
-@@ -333 +378,9 @@ public override void ComputeMarkedNodes()
+@@ -333 +454,9 @@ public override void ComputeMarkedNodes()
 -                            _deferredStaticDependencies.Remove(_currentDependencyPhase);
 +                            if (s_deferredPhaseListsEnabled)
 +                            {
@@ -967,15 +1963,15 @@ index e7f7503bb..dd0596626 100644
 +                            {
 +                                _deferredStaticDependencies.Remove(_currentDependencyPhase);
 +                            }
-@@ -342 +395,4 @@ public override void ComputeMarkedNodes()
+@@ -342 +471,4 @@ public override void ComputeMarkedNodes()
 -                } while ((_markStack.Count != 0) || (_deferredStaticDependencies.Count != 0));
 +                } while ((_markStack.Count != 0) ||
 +                    (s_deferredPhaseListsEnabled ?
 +                        _deferredStaticDependencyPhaseCount != 0 :
 +                        _deferredStaticDependencies.Count != 0));
-@@ -343,0 +400 @@ public override void ComputeMarkedNodes()
+@@ -343,0 +476 @@ public override void ComputeMarkedNodes()
 +                long resultSortStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -345 +402,12 @@ public override void ComputeMarkedNodes()
+@@ -345 +478,12 @@ public override void ComputeMarkedNodes()
 -                    _markedNodes.MergeSortAllowDuplicates(_resultSorter);
 +                {
 +                    if (s_filteredResultSortEnabled &&
@@ -989,13 +1985,15 @@ index e7f7503bb..dd0596626 100644
 +                    }
 +                }
 +                IlcOptimizationExperiments.RecordPhase("graph-result-sort", resultSortStart);
-@@ -346,0 +415 @@ public override void ComputeMarkedNodes()
+@@ -346,0 +491 @@ public override void ComputeMarkedNodes()
 +                long finalCopyStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -347,0 +417,3 @@ public override void ComputeMarkedNodes()
+@@ -347,0 +493,5 @@ public override void ComputeMarkedNodes()
 +                IlcOptimizationExperiments.RecordPhase("graph-final-copy", finalCopyStart);
 +                IlcOptimizationExperiments.SetCounter("graph-deferred-node-count", _deferredNodeCount);
 +                IlcOptimizationExperiments.SetCounter("graph-marked-node-count", _markedNodes.Count);
-@@ -352,0 +425,33 @@ public override void ComputeMarkedNodes()
++                IlcOptimizationExperiments.SetCounter("graph-conditional-bucket-count", _conditionalBucketCount);
++                IlcOptimizationExperiments.SetCounter("graph-conditional-bucket-promotion-count", _conditionalBucketPromotionCount);
+@@ -352,0 +503,33 @@ public override void ComputeMarkedNodes()
 +        private void FilteredSortMarkedNodes(IFilteredDependencyNodeComparer<DependencyNodeCore<DependencyContextType>> filteredComparer)
 +        {
 +            var sortableNodes = new List<DependencyNodeCore<DependencyContextType>>(Math.Max(4, _markedNodes.Count / 8));
@@ -1037,10 +2035,10 @@ index 28aa33b5a..f18ba405e 100644
 +    <Compile Include="IlcOptimizationExperiments.cs" />
 diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs
 new file mode 100644
-index 000000000..158d738e1
+index 000000000..b8fc18459
 --- /dev/null
 +++ b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,175 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -1106,6 +2104,20 @@ index 000000000..158d738e1
 +            lock (s_metricsLock)
 +            {
 +                s_counters[name] = value;
++            }
++        }
++
++        public static void AddCounter(string name, long value)
++        {
++            if (!s_metricsEnabled)
++            {
++                return;
++            }
++
++            lock (s_metricsLock)
++            {
++                s_counters.TryGetValue(name, out long currentValue);
++                s_counters[name] = currentValue + value;
 +            }
 +        }
 +

@@ -12,6 +12,8 @@ param(
     [Parameter(Mandatory)]
     [string] $RunRoot,
 
+    [string[]] $Experiments = @(),
+
     [int] $SampleIntervalMilliseconds = 1000,
 
     [switch] $ProfileMethods
@@ -85,6 +87,7 @@ $environment = @{}
 foreach ($name in @(
     'DOTNET_ROOT',
     'DOTNET_MULTILEVEL_LOOKUP',
+    'DOTNET_ILC_EXPERIMENTS',
     'DOTNET_ILC_PROFILE_PATH',
     'DOTNET_ILC_PROFILE_METHODS'))
 {
@@ -106,6 +109,14 @@ try
 {
     $env:DOTNET_ROOT = Split-Path -Parent (Get-Command dotnet).Source
     $env:DOTNET_MULTILEVEL_LOOKUP = '0'
+    if ($Experiments.Count -gt 0)
+    {
+        $env:DOTNET_ILC_EXPERIMENTS = $Experiments -join ';'
+    }
+    else
+    {
+        Remove-Item Env:DOTNET_ILC_EXPERIMENTS -ErrorAction SilentlyContinue
+    }
     $env:DOTNET_ILC_PROFILE_PATH = $profilePath
     $env:DOTNET_ILC_PROFILE_METHODS = $ProfileMethods.IsPresent.ToString()
 
@@ -188,6 +199,7 @@ $metadata = [pscustomobject] @{
     ReadBytes = ($samples | Measure-Object ReadBytes -Maximum).Maximum
     WriteBytes = ($samples | Measure-Object WriteBytes -Maximum).Maximum
     SampleCount = $samples.Count
+    Experiments = $Experiments
     ProfileMethods = $ProfileMethods.IsPresent
     IlcPath = $ilcPath
     IlcExeSha256 = (Get-FileHash $ilcPath -Algorithm SHA256).Hash

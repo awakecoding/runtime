@@ -294,6 +294,79 @@ parallelism would increase memory pressure without addressing the serial graph/o
 PGO is a runtime-performance tool, not a build-time remedy. It can increase compilation work
 and does not address the measured graph and object-writer costs.
 
+## Wave 1 optimization experiments
+
+Wave 1 tested five independently gated implementation hypotheses against the exact retained
+RDM response file (SHA-256
+`997874CB4139F822AA2C659727E9BA93960B7F9872970A8D4322DC007FC9EDF9`).
+All controls and experiments used one compiler build and changed only
+`DOTNET_ILC_EXPERIMENTS`.
+
+The shared machine produced valid control times from 605.450 to 818.591 seconds despite an
+idle-start guard, so total wall time alone is not a reliable comparison. Results use:
+
+* interleaved controls;
+* the midpoint of controls bracketing a variant when both were in the same regime;
+* targeted subphase direction across repetitions;
+* allocation, GC, and peak-memory measurements;
+* object size/hash and COFF cardinality checks.
+
+One null-interner run and one control were terminated and excluded when unrelated system
+load left only 5.7-7.7 GB physical memory available. Raw valid and invalid runs are retained
+under `artifacts\nativeaot-profile\experiments\full-rdm`.
+
+| Hypothesis | Implementation | Full RDM result | Verdict |
+| --- | --- | --- | --- |
+| Filter final graph before sorting | Stable-partition non-object nodes and sort only `ObjectNode` instances | 13.455M of 30.667M nodes still required sorting. Sort rose 10.307 to 13.307 s; wall regressed 3.5%. | **Regression** |
+| Null-interner fast path | Return immediately for `ObjectDataInterner.Null` | Target materialization was +2.0% in pair 1 and -2.2% in pair 2; allocation was neutral. | **Neutral** |
+| Lazy per-section state | Lazy symbolic/COFF relocation lists, shared padding, inline first section buffer | Allocation fell 1.13-1.21 GiB in both runs. Pair 2 object emission fell 5.6%; pair 1 was nearly neutral. | **Win: memory and modest object time** |
+| Eager object-writer preallocation | Pre-size 3.833M section and 18.400M symbol slots | Pair 1 object emission fell 8-12%; pair 2 regressed 22.6%. Allocation fell about 0.6 GiB but response to memory/cache regime was unstable. | **Neutral/unstable** |
+| Hash-based COFF string reservation | HashSet deduplication plus one ordinal sort before suffix sorting | `coff-string-reserve` fell from 7.66-8.59 s to 4.63 s (40-46%). Output and allocation were unchanged. | **Win: targeted 3-4 s** |
+
+The filtered-sort object was the only non-byte-identical output. It retained identical size
+and cardinality and linked successfully into the same-size RDM executable. The layout change
+comes from comparer-equal ordering boundaries. Every other experiment produced the same
+3,744,336,196-byte object with SHA-256
+`5B3E5823E9BE816DACD4D47311449E20F0F8233FC5A853439BC30F1F2A351B3D`.
+
+### Wave 1 combined result
+
+The accepted combination is:
+
+```text
+lazy-relocation-lists;compact-section-data;string-table-hashset
+```
+
+Its repeat run was compared with controls at 818.591 and 605.450 seconds. That 213-second
+control swing makes the raw -9.7% midpoint result or +6.2% nearest-control result unsuitable
+as an expected end-to-end gain. Targeted phases and resources are stable enough to establish
+the mechanism:
+
+| Metric | Control midpoint | Combined | Change |
+| --- | ---: | ---: | ---: |
+| Object emission | 202.10 s | 195.08 s | -3.47% |
+| Node materialization | 114.97 s | 111.42 s | -3.08% |
+| Relocation resolution | 25.72 s | 22.54 s | -12.37% |
+| COFF string reservation | 11.66 s | 4.24 s | -63.63% |
+| Object file write | 39.24 s | 38.10 s | -2.92% |
+| Managed allocation | 115.55-115.77 GiB | 113.97 GiB | -1.58 to -1.80 GiB |
+| Peak working set | 33.77-35.34 GiB | 33.75 GiB | neutral to -1.59 GiB |
+
+COFF symbol writing regressed in this sample, offsetting part of the string-reservation
+saving. Wave 1 therefore proves lower allocation and about seven seconds of object-phase
+work, but not a repeatable whole-compiler wall reduction above environmental variance.
+
+### Wave 1 screening replacements
+
+Three additional gates were screened but did not consume a full RDM run:
+
+* `deferred-phase-lists` replaced an integer-keyed dictionary with phase-indexed lists but
+  showed no targeted benefit on the 204,906-node EntryModel graph.
+* `conditional-remove` combined lookup/removal of satisfied conditional dependencies but
+  showed no targeted benefit.
+* `large-coff-buffer` used a 1 MB sequential file buffer but did not improve the 95 MB
+  EntryModel object-write phase.
+
 ## Reproduction
 
 1. Check out runtime tag `v10.0.11`.
@@ -302,7 +375,13 @@ and does not address the measured graph and object-writer costs.
 4. Run `Invoke-RdmPublish.ps1` with a short output root to restore/publish and retain the
    MSBuild binlog and ILC response.
 5. Run `Invoke-IlcProfile.ps1` on the retained response. Omit `-ProfileMethods` for the
-   authoritative phase profile; add it only for an intrusive ranking run.
+   authoritative phase profile; add it only for an intrusive ranking run. Pass experiment
+   gates with `-Experiments`, for example:
+
+   ```powershell
+   -Experiments lazy-relocation-lists,compact-section-data,string-table-hashset
+   ```
+
 6. Run `Analyze-IlcProfile.ps1` to produce compact CSV summaries.
 
 Bulky profile outputs belong under `artifacts/` or another ignored directory, not source

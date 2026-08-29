@@ -1,9 +1,22 @@
+diff --git a/src/coreclr/tools/Common/Compiler/DependencyAnalysis/SortableDependencyNode.cs b/src/coreclr/tools/Common/Compiler/DependencyAnalysis/SortableDependencyNode.cs
+index 62297efb6..3293153ba 100644
+--- a/src/coreclr/tools/Common/Compiler/DependencyAnalysis/SortableDependencyNode.cs
++++ b/src/coreclr/tools/Common/Compiler/DependencyAnalysis/SortableDependencyNode.cs
+@@ -126 +126 @@ public int Compare(EmbeddedObjectNode x, EmbeddedObjectNode y)
+-        public class ObjectNodeComparer : IComparer<DependencyNodeCore<NodeFactory>>
++        public class ObjectNodeComparer : IFilteredDependencyNodeComparer<DependencyNodeCore<NodeFactory>>
+@@ -153,0 +154,5 @@ public int Compare(DependencyNodeCore<NodeFactory> x1, DependencyNodeCore<NodeFa
++
++            public bool ShouldSort(DependencyNodeCore<NodeFactory> value)
++            {
++                return value is ObjectNode;
++            }
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
 new file mode 100644
-index 000000000..31658ac51
+index 000000000..a73c222b5
 --- /dev/null
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,468 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -16,6 +29,8 @@ index 000000000..31658ac51
 +using System.IO;
 +using System.Text;
 +using System.Threading;
++
++using ILCompiler.DependencyAnalysisFramework;
 +
 +using Internal.TypeSystem;
 +using Internal.TypeSystem.Ecma;
@@ -202,6 +217,7 @@ index 000000000..31658ac51
 +        SetCounter("max-concurrent-method-compilations", s_maxConcurrentMethodCompilations);
 +        SetCounter("process-working-set-bytes-before-report", Environment.WorkingSet);
 +        SetCounter("method-profiling-enabled", s_methodsEnabled ? 1 : 0);
++        string[] enabledExperiments = IlcOptimizationExperiments.GetEnabledExperimentNames();
 +
 +        var mergedMethods = new Dictionary<MethodDesc, MethodTiming>();
 +        foreach (Dictionary<MethodDesc, MethodTiming> batch in s_methodTimingBatches)
@@ -282,6 +298,15 @@ index 000000000..31658ac51
 +            {
 +                WriteRow(writer, "counter", pair.Key, "", 0, 0, 0, 0, pair.Value.ToString(CultureInfo.InvariantCulture));
 +            }
++            foreach (IlcOptimizationExperiments.PhaseMetric metric in IlcOptimizationExperiments.GetPhaseMetrics())
++            {
++                WriteRow(writer, "phase", "experiment-" + metric.Name, "", metric.Count, metric.TotalTicks, metric.MaxTicks, 0, "");
++            }
++            foreach (IlcOptimizationExperiments.CounterMetric metric in IlcOptimizationExperiments.GetCounters())
++            {
++                WriteRow(writer, "counter", "experiment-" + metric.Name, "", 0, 0, 0, 0, metric.Value.ToString(CultureInfo.InvariantCulture));
++            }
++            WriteRow(writer, "config", "experiments", "", 0, 0, 0, 0, string.Join(';', enabledExperiments));
 +            foreach (WorkerSample sample in s_workerSamples)
 +            {
 +                WriteRow(writer, "worker-sample", "active-method-compilations", "", sample.ActiveMethodCompilations, sample.ElapsedTicks, 0, 0, "");
@@ -475,12 +500,708 @@ index 93a2e79d9..b35fa721b 100644
 +            {
 +                CompilerProfile.RecordPhase("metadata-computation", metadataStart);
 +            }
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectDataInterner.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectDataInterner.cs
+index f54d68cf0..9b883e7b3 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectDataInterner.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectDataInterner.cs
+@@ -7,0 +8 @@
++using ILCompiler.DependencyAnalysisFramework;
+@@ -16,0 +18,2 @@ public sealed class ObjectDataInterner
++        private static readonly bool s_nullFastPathEnabled = IlcOptimizationExperiments.IsEnabled("null-interner-fast-path");
++
+@@ -82,0 +86,5 @@ public ISymbolNode GetDeduplicatedSymbol(NodeFactory factory, ISymbolNode origin
++            if (s_nullFastPathEnabled && this == Null)
++            {
++                return original;
++            }
++
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
+index d6deb2760..5a0cafad4 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
+@@ -50 +50,20 @@ internal sealed class CoffObjectWriter : ObjectWriter
+-        private sealed record SectionDefinition(CoffSectionHeader Header, Stream Stream, List<CoffRelocation> Relocations, string ComdatName, string SymbolName);
++        private static readonly bool s_largeFileBufferEnabled = IlcOptimizationExperiments.IsEnabled("large-coff-buffer");
++        private static readonly bool s_preallocateCollectionsEnabled = IlcOptimizationExperiments.IsEnabled("preallocate-object-writer");
++
++        private sealed class SectionDefinition
++        {
++            public SectionDefinition(CoffSectionHeader header, Stream stream, List<CoffRelocation> relocations, string comdatName, string symbolName)
++            {
++                Header = header;
++                Stream = stream;
++                Relocations = relocations;
++                ComdatName = comdatName;
++                SymbolName = symbolName;
++            }
++
++            public CoffSectionHeader Header { get; }
++            public Stream Stream { get; }
++            public List<CoffRelocation> Relocations { get; set; }
++            public string ComdatName { get; }
++            public string SymbolName { get; }
++        }
+@@ -87,0 +107,14 @@ public CoffObjectWriter(NodeFactory factory, ObjectWritingOptions options)
++        private protected override void PrepareForEmission(int markedNodeCount, int estimatedSectionCount)
++        {
++            if (!s_preallocateCollectionsEnabled)
++            {
++                return;
++            }
++
++            int estimatedSymbolCount = (int)Math.Min(int.MaxValue, Math.Max(16L, (long)markedNodeCount * 3 / 5));
++            _sections.EnsureCapacity(estimatedSectionCount);
++            _symbols.EnsureCapacity(estimatedSymbolCount);
++            _sectionNumberToComdatAuxRecord.EnsureCapacity(estimatedSectionCount);
++            IlcOptimizationExperiments.SetCounter("object-preallocated-symbol-capacity", estimatedSymbolCount);
++        }
++
+@@ -165 +198,6 @@ private protected override void CreateSection(ObjectNodeSection section, string
+-            _sections.Add(new SectionDefinition(sectionHeader, sectionStream, new List<CoffRelocation>(), comdatName, symbolName));
++            _sections.Add(new SectionDefinition(
++                sectionHeader,
++                sectionStream,
++                LazyRelocationListsEnabled ? null : new List<CoffRelocation>(),
++                comdatName,
++                symbolName));
+@@ -279,0 +318,6 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
++                if (coffRelocations is null)
++                {
++                    coffRelocations = new List<CoffRelocation>(relocationList.Count + 1);
++                    _sections[sectionIndex].Relocations = coffRelocations;
++                }
++
+@@ -471 +515,9 @@ private protected override void EmitObjectFile(string objectFilePath)
+-            using var outputFileStream = new FileStream(objectFilePath, FileMode.Create);
++            using FileStream outputFileStream = s_largeFileBufferEnabled ?
++                new FileStream(
++                    objectFilePath,
++                    FileMode.Create,
++                    FileAccess.Write,
++                    FileShare.None,
++                    1024 * 1024,
++                    FileOptions.SequentialScan) :
++                new FileStream(objectFilePath, FileMode.Create);
+@@ -480,0 +533 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long layoutStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -499,2 +552,3 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                section.Header.PointerToRelocations = section.Relocations.Count > 0 ? dataOffset : 0;
+-                dataOffset += (uint)(section.Relocations.Count * CoffRelocation.Size);
++                int relocationCount = section.Relocations?.Count ?? 0;
++                section.Header.PointerToRelocations = relocationCount > 0 ? dataOffset : 0;
++                dataOffset += (uint)(relocationCount * CoffRelocation.Size);
+@@ -505,0 +560 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-file-layout", layoutStart);
+@@ -507,0 +563 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long headerWriteStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -531,0 +588 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-header-write", headerWriteStart);
+@@ -533,0 +591 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long contentWriteStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -543 +601 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                if (section.Relocations.Count > 0)
++                if (section.Relocations is not null)
+@@ -550,0 +609 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-content-write", contentWriteStart);
+@@ -552,0 +612 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long stringReserveStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -559,0 +620 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-string-reserve", stringReserveStart);
+@@ -561,0 +623 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long symbolWriteStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -566,0 +629 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-symbol-write", symbolWriteStart);
+@@ -568,0 +632 @@ private protected override void EmitObjectFile(string objectFilePath)
++            long stringWriteStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -569,0 +634,3 @@ private protected override void EmitObjectFile(string objectFilePath)
++            IlcOptimizationExperiments.RecordPhase("coff-string-write", stringWriteStart);
++            IlcOptimizationExperiments.SetCounter("coff-section-count", _sections.Count);
++            IlcOptimizationExperiments.SetCounter("coff-symbol-record-count", _symbols.Count);
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
+index 6db2bc20b..f6281bfe7 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
+@@ -20,0 +21,3 @@ public abstract class ObjectWriter
++        private static readonly bool s_lazyRelocationListsEnabled = IlcOptimizationExperiments.IsEnabled("lazy-relocation-lists");
++        private static readonly bool s_preallocateCollectionsEnabled = IlcOptimizationExperiments.IsEnabled("preallocate-object-writer");
++
+@@ -60,0 +64,6 @@ private protected ObjectWriter(NodeFactory factory, ObjectWritingOptions options
++        private protected static bool LazyRelocationListsEnabled => s_lazyRelocationListsEnabled;
++
++        private protected virtual void PrepareForEmission(int markedNodeCount, int estimatedSectionCount)
++        {
++        }
++
+@@ -90 +99 @@ private protected SectionWriter GetOrCreateSection(ObjectNodeSection section, st
+-                _sectionIndexToRelocations.Add(new());
++                _sectionIndexToRelocations.Add(s_lazyRelocationListsEnabled ? null : new List<SymbolicRelocation>());
+@@ -207 +216,7 @@ protected internal virtual void EmitRelocation(
+-            _sectionIndexToRelocations[sectionIndex].Add(new SymbolicRelocation(offset, relocType, symbolName, addend));
++            List<SymbolicRelocation> relocations = _sectionIndexToRelocations[sectionIndex];
++            if (relocations is null)
++            {
++                relocations = new List<SymbolicRelocation>();
++                _sectionIndexToRelocations[sectionIndex] = relocations;
++            }
++            relocations.Add(new SymbolicRelocation(offset, relocType, symbolName, addend));
+@@ -212 +227 @@ private protected bool SectionHasRelocations(int sectionIndex)
+-            return _sectionIndexToRelocations[sectionIndex].Count > 0;
++            return _sectionIndexToRelocations[sectionIndex]?.Count > 0;
+@@ -310,0 +326,6 @@ private SortedSet<string> GetUndefinedSymbols()
++            {
++            if (relocationList is null)
++            {
++                continue;
++            }
++
+@@ -317,0 +339 @@ private SortedSet<string> GetUndefinedSymbols()
++            }
+@@ -340,0 +363,9 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            if (s_preallocateCollectionsEnabled)
++            {
++                int estimatedSectionCount = Math.Max(16, nodes.Count / 8);
++                _sectionIndexToData.EnsureCapacity(estimatedSectionCount);
++                _sectionIndexToRelocations.EnsureCapacity(estimatedSectionCount);
++                PrepareForEmission(nodes.Count, estimatedSectionCount);
++                IlcOptimizationExperiments.SetCounter("object-preallocated-section-capacity", estimatedSectionCount);
++            }
++
+@@ -374 +405,2 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-            List<BlockToRelocate> blocksToRelocate = new();
++            var blocksToRelocate = new List<BlockToRelocate>();
++            long materializationStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -475,0 +508 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IlcOptimizationExperiments.RecordPhase("object-node-materialization", materializationStart);
+@@ -476,0 +510 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            long relocationResolutionStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -502,0 +537 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            int blocksWithRelocations = blocksToRelocate.Count;
+@@ -503,0 +539 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IlcOptimizationExperiments.RecordPhase("object-relocation-resolution", relocationResolutionStart);
+@@ -504,0 +541 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            long sectionLayoutStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -505,0 +543 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IlcOptimizationExperiments.RecordPhase("object-section-layout", sectionLayoutStart);
+@@ -561 +599,7 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-            EmitSymbolTable(_definedSymbols, GetUndefinedSymbols());
++            long undefinedSymbolsStart = IlcOptimizationExperiments.GetTimestamp();
++            SortedSet<string> undefinedSymbols = GetUndefinedSymbols();
++            IlcOptimizationExperiments.RecordPhase("object-undefined-symbols", undefinedSymbolsStart);
++
++            long symbolTableStart = IlcOptimizationExperiments.GetTimestamp();
++            EmitSymbolTable(_definedSymbols, undefinedSymbols);
++            IlcOptimizationExperiments.RecordPhase("object-symbol-table", symbolTableStart);
+@@ -562,0 +607 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            long relocationConversionStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -566 +611,4 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-                EmitRelocations(relocSectionIndex, relocationList);
++                if (relocationList is not null)
++                {
++                    EmitRelocations(relocSectionIndex, relocationList);
++                }
+@@ -568,0 +617 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IlcOptimizationExperiments.RecordPhase("object-relocation-conversion", relocationConversionStart);
+@@ -569,0 +619 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            long fileWriteStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -570,0 +621,6 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IlcOptimizationExperiments.RecordPhase("object-file-write", fileWriteStart);
++            IlcOptimizationExperiments.SetCounter("object-blocks-with-relocations", blocksWithRelocations);
++            IlcOptimizationExperiments.SetCounter("object-defined-symbol-count", _definedSymbols.Count);
++            IlcOptimizationExperiments.SetCounter("object-mangled-name-count", _mangledNameMap.Count);
++            IlcOptimizationExperiments.SetCounter("object-section-count", _sectionIndexToData.Count);
++            IlcOptimizationExperiments.SetCounter("object-undefined-symbol-count", undefinedSymbols.Count);
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/SectionData.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/SectionData.cs
+index 9ae566487..f16c618c6 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/SectionData.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/SectionData.cs
+@@ -12,0 +13,2 @@
++using ILCompiler.DependencyAnalysisFramework;
++
+@@ -25,2 +27,8 @@ internal sealed class SectionData
+-        private readonly ArrayBufferWriter<byte> _appendBuffer = new();
+-        private readonly List<ReadOnlyMemory<byte>> _buffers = new();
++        private static readonly bool s_compactBuffersEnabled = IlcOptimizationExperiments.IsEnabled("compact-section-data");
++        private static readonly byte[] s_zeroPadding = new byte[16];
++        private static readonly byte[] s_instructionPadding = CreatePadding(0x90);
++
++        private ArrayBufferWriter<byte> _appendBuffer = s_compactBuffersEnabled ? null : new ArrayBufferWriter<byte>();
++        private List<ReadOnlyMemory<byte>> _buffers = s_compactBuffersEnabled ? null : new List<ReadOnlyMemory<byte>>();
++        private ReadOnlyMemory<byte> _firstBuffer;
++        private int _bufferCount;
+@@ -28 +36 @@ internal sealed class SectionData
+-        private readonly byte[] _padding = new byte[16];
++        private readonly byte[] _padding;
+@@ -32 +40,14 @@ public SectionData(byte paddingByte = 0)
+-            _padding.AsSpan().Fill(paddingByte);
++            if (s_compactBuffersEnabled)
++            {
++                _padding = paddingByte switch
++                {
++                    0 => s_zeroPadding,
++                    0x90 => s_instructionPadding,
++                    _ => CreatePadding(paddingByte),
++                };
++            }
++            else
++            {
++                _padding = new byte[16];
++                _padding.AsSpan().Fill(paddingByte);
++            }
+@@ -37 +58 @@ private void FlushAppendBuffer()
+-            if (_appendBuffer.WrittenCount > 0)
++            if (_appendBuffer is not null && _appendBuffer.WrittenCount > 0)
+@@ -39 +60 @@ private void FlushAppendBuffer()
+-                _buffers.Add(_appendBuffer.WrittenSpan.ToArray());
++                AddBuffer(_appendBuffer.WrittenSpan.ToArray());
+@@ -48 +69 @@ public void AppendData(ReadOnlyMemory<byte> data)
+-            _buffers.Add(data);
++            AddBuffer(data);
+@@ -56 +77 @@ public void AppendPadding(int paddingLength)
+-                if (_appendBuffer.WrittenCount > 0 || paddingLength > _padding.Length)
++                if ((_appendBuffer is not null && _appendBuffer.WrittenCount > 0) || paddingLength > _padding.Length)
+@@ -58,2 +79,3 @@ public void AppendPadding(int paddingLength)
+-                    _appendBuffer.GetSpan(paddingLength).Slice(0, paddingLength).Fill(_padding[0]);
+-                    _appendBuffer.Advance(paddingLength);
++                    ArrayBufferWriter<byte> appendBuffer = GetAppendBuffer();
++                    appendBuffer.GetSpan(paddingLength).Slice(0, paddingLength).Fill(_padding[0]);
++                    appendBuffer.Advance(paddingLength);
+@@ -68 +90 @@ public void AppendPadding(int paddingLength)
+-        public IBufferWriter<byte> BufferWriter => _appendBuffer;
++        public IBufferWriter<byte> BufferWriter => GetAppendBuffer();
+@@ -70 +92 @@ public void AppendPadding(int paddingLength)
+-        public long Length => _length + _appendBuffer.WrittenCount;
++        public long Length => _length + (_appendBuffer?.WrittenCount ?? 0);
+@@ -76,0 +99,43 @@ public void AppendPadding(int paddingLength)
++        private static byte[] CreatePadding(byte value)
++        {
++            var result = new byte[16];
++            result.AsSpan().Fill(value);
++            return result;
++        }
++
++        private ArrayBufferWriter<byte> GetAppendBuffer()
++        {
++            return _appendBuffer ??= new ArrayBufferWriter<byte>();
++        }
++
++        private void AddBuffer(ReadOnlyMemory<byte> data)
++        {
++            if (!s_compactBuffersEnabled)
++            {
++                _buffers.Add(data);
++                return;
++            }
++
++            if (_bufferCount == 0)
++            {
++                _firstBuffer = data;
++            }
++            else
++            {
++                if (_buffers is null)
++                {
++                    _buffers = new List<ReadOnlyMemory<byte>>();
++                    _buffers.Add(_firstBuffer);
++                }
++                _buffers.Add(data);
++            }
++            _bufferCount++;
++        }
++
++        private int BufferCount => s_compactBuffersEnabled ? _bufferCount : _buffers.Count;
++
++        private ReadOnlyMemory<byte> GetBuffer(int index)
++        {
++            return s_compactBuffersEnabled && _buffers is null ? _firstBuffer : _buffers[index];
++        }
++
+@@ -101 +166 @@ public override long Position
+-                    while (_position < value && _bufferIndex < _sectionData._buffers.Count)
++                    while (_position < value && _bufferIndex < _sectionData.BufferCount)
+@@ -103 +168,2 @@ public override long Position
+-                        if (_sectionData._buffers[_bufferIndex].Length < value - _position)
++                        ReadOnlyMemory<byte> currentBuffer = _sectionData.GetBuffer(_bufferIndex);
++                        if (currentBuffer.Length < value - _position)
+@@ -105 +171 @@ public override long Position
+-                            _position += _sectionData._buffers[_bufferIndex].Length;
++                            _position += currentBuffer.Length;
+@@ -139 +205 @@ public override int Read(Span<byte> buffer)
+-                while (_position < _sectionData._length && _bufferIndex < _sectionData._buffers.Count)
++                while (_position < _sectionData._length && _bufferIndex < _sectionData.BufferCount)
+@@ -141 +207 @@ public override int Read(Span<byte> buffer)
+-                    ReadOnlySpan<byte> currentBuffer = _sectionData._buffers[_bufferIndex].Span.Slice(_bufferPosition);
++                    ReadOnlySpan<byte> currentBuffer = _sectionData.GetBuffer(_bufferIndex).Span.Slice(_bufferPosition);
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
+index 81f7315d2..5ef65af0e 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/StringTableBuilder.cs
+@@ -11,0 +12,2 @@
++using ILCompiler.DependencyAnalysisFramework;
++
+@@ -15,0 +18,2 @@ internal class StringTableBuilder
++        private static readonly bool s_hashSetReserveEnabled = IlcOptimizationExperiments.IsEnabled("string-table-hashset");
++
+@@ -17,0 +22,3 @@ internal class StringTableBuilder
++        private readonly HashSet<string> _reservedStringsHash = s_hashSetReserveEnabled ?
++            new HashSet<string>(StringComparer.Ordinal) :
++            null;
+@@ -39 +46,8 @@ public void ReserveString(string text)
+-                _reservedStrings.Add(text);
++                if (s_hashSetReserveEnabled)
++                {
++                    _reservedStringsHash.Add(text);
++                }
++                else
++                {
++                    _reservedStrings.Add(text);
++                }
+@@ -45 +59,11 @@ private void FlushReservedStrings()
+-            string[] reservedStrings = _reservedStrings.ToArray();
++            string[] reservedStrings;
++            if (s_hashSetReserveEnabled)
++            {
++                reservedStrings = new string[_reservedStringsHash.Count];
++                _reservedStringsHash.CopyTo(reservedStrings);
++                Array.Sort(reservedStrings, StringComparer.Ordinal);
++            }
++            else
++            {
++                reservedStrings = _reservedStrings.ToArray();
++            }
+@@ -69 +93,8 @@ private void FlushReservedStrings()
+-            _reservedStrings.Clear();
++            if (s_hashSetReserveEnabled)
++            {
++                _reservedStringsHash.Clear();
++            }
++            else
++            {
++                _reservedStrings.Clear();
++            }
+@@ -172 +203 @@ public uint GetStringOffset(string text)
+-            if (_reservedStrings.Count > 0)
++            if (s_hashSetReserveEnabled ? _reservedStringsHash.Count > 0 : _reservedStrings.Count > 0)
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
 index 862404c49..814e4340e 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
 @@ -494,0 +495 @@
 +    <Compile Include="Compiler\CompilerProfile.cs" />
+diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
+index e7f7503bb..dd0596626 100644
+--- a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
++++ b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
+@@ -29,0 +30,4 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
++        private static readonly bool s_conditionalRemoveEnabled = IlcOptimizationExperiments.IsEnabled("conditional-remove");
++        private static readonly bool s_deferredPhaseListsEnabled = IlcOptimizationExperiments.IsEnabled("deferred-phase-lists");
++        private static readonly bool s_filteredResultSortEnabled = IlcOptimizationExperiments.IsEnabled("filtered-result-sort");
++
+@@ -37,0 +42,2 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
++        private List<List<DependencyNodeCore<DependencyContextType>>> _deferredStaticDependenciesByPhase = new List<List<DependencyNodeCore<DependencyContextType>>>();
++        private int _deferredStaticDependencyPhaseCount;
+@@ -43,0 +50 @@ public sealed class DependencyAnalyzer<MarkStrategy, DependencyContextType> : De
++        private long _deferredNodeCount;
+@@ -227 +234,17 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
+-                if (!_deferredStaticDependencies.TryGetValue(dependencyPhase, out var deferredPerPhaseDependencies))
++                List<DependencyNodeCore<DependencyContextType>> deferredPerPhaseDependencies;
++                if (s_deferredPhaseListsEnabled)
++                {
++                    while (_deferredStaticDependenciesByPhase.Count <= dependencyPhase)
++                    {
++                        _deferredStaticDependenciesByPhase.Add(null);
++                    }
++
++                    deferredPerPhaseDependencies = _deferredStaticDependenciesByPhase[dependencyPhase];
++                    if (deferredPerPhaseDependencies is null)
++                    {
++                        deferredPerPhaseDependencies = new List<DependencyNodeCore<DependencyContextType>>();
++                        _deferredStaticDependenciesByPhase[dependencyPhase] = deferredPerPhaseDependencies;
++                        _deferredStaticDependencyPhaseCount++;
++                    }
++                }
++                else if (!_deferredStaticDependencies.TryGetValue(dependencyPhase, out deferredPerPhaseDependencies))
+@@ -232,0 +256 @@ private void GetStaticDependencies(DependencyNodeCore<DependencyContextType> nod
++                _deferredNodeCount++;
+@@ -269 +293,4 @@ private void ProcessMarkStack()
+-                    if (_conditional_dependency_store.TryGetValue(currentNode, out storedDependencySet))
++                    bool hasStoredDependencies = s_conditionalRemoveEnabled ?
++                        _conditional_dependency_store.Remove(currentNode, out storedDependencySet) :
++                        _conditional_dependency_store.TryGetValue(currentNode, out storedDependencySet);
++                    if (hasStoredDependencies)
+@@ -276 +303,4 @@ private void ProcessMarkStack()
+-                        _conditional_dependency_store.Remove(currentNode);
++                        if (!s_conditionalRemoveEnabled)
++                        {
++                            _conditional_dependency_store.Remove(currentNode);
++                        }
+@@ -305,0 +336 @@ public override void ComputeMarkedNodes()
++                    long markStackStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -309,0 +341 @@ public override void ComputeMarkedNodes()
++                    IlcOptimizationExperiments.RecordPhase("graph-mark-stack", markStackStart);
+@@ -312 +344,12 @@ public override void ComputeMarkedNodes()
+-                    _deferredStaticDependencies.TryGetValue(_currentDependencyPhase, out var deferredDependenciesInCurrentPhase);
++                    List<DependencyNodeCore<DependencyContextType>> deferredDependenciesInCurrentPhase;
++                    if (s_deferredPhaseListsEnabled)
++                    {
++                        deferredDependenciesInCurrentPhase =
++                            _currentDependencyPhase < _deferredStaticDependenciesByPhase.Count ?
++                            _deferredStaticDependenciesByPhase[_currentDependencyPhase] :
++                            null;
++                    }
++                    else
++                    {
++                        _deferredStaticDependencies.TryGetValue(_currentDependencyPhase, out deferredDependenciesInCurrentPhase);
++                    }
+@@ -315,0 +359 @@ public override void ComputeMarkedNodes()
++                        long deferredStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -323,0 +368 @@ public override void ComputeMarkedNodes()
++                        IlcOptimizationExperiments.RecordPhase("graph-deferred-compute", deferredStart);
+@@ -333 +378,9 @@ public override void ComputeMarkedNodes()
+-                            _deferredStaticDependencies.Remove(_currentDependencyPhase);
++                            if (s_deferredPhaseListsEnabled)
++                            {
++                                _deferredStaticDependenciesByPhase[_currentDependencyPhase] = null;
++                                _deferredStaticDependencyPhaseCount--;
++                            }
++                            else
++                            {
++                                _deferredStaticDependencies.Remove(_currentDependencyPhase);
++                            }
+@@ -342 +395,4 @@ public override void ComputeMarkedNodes()
+-                } while ((_markStack.Count != 0) || (_deferredStaticDependencies.Count != 0));
++                } while ((_markStack.Count != 0) ||
++                    (s_deferredPhaseListsEnabled ?
++                        _deferredStaticDependencyPhaseCount != 0 :
++                        _deferredStaticDependencies.Count != 0));
+@@ -343,0 +400 @@ public override void ComputeMarkedNodes()
++                long resultSortStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -345 +402,12 @@ public override void ComputeMarkedNodes()
+-                    _markedNodes.MergeSortAllowDuplicates(_resultSorter);
++                {
++                    if (s_filteredResultSortEnabled &&
++                        _resultSorter is IFilteredDependencyNodeComparer<DependencyNodeCore<DependencyContextType>> filteredComparer)
++                    {
++                        FilteredSortMarkedNodes(filteredComparer);
++                    }
++                    else
++                    {
++                        _markedNodes.MergeSortAllowDuplicates(_resultSorter);
++                    }
++                }
++                IlcOptimizationExperiments.RecordPhase("graph-result-sort", resultSortStart);
+@@ -346,0 +415 @@ public override void ComputeMarkedNodes()
++                long finalCopyStart = IlcOptimizationExperiments.GetTimestamp();
+@@ -347,0 +417,3 @@ public override void ComputeMarkedNodes()
++                IlcOptimizationExperiments.RecordPhase("graph-final-copy", finalCopyStart);
++                IlcOptimizationExperiments.SetCounter("graph-deferred-node-count", _deferredNodeCount);
++                IlcOptimizationExperiments.SetCounter("graph-marked-node-count", _markedNodes.Count);
+@@ -352,0 +425,33 @@ public override void ComputeMarkedNodes()
++        private void FilteredSortMarkedNodes(IFilteredDependencyNodeComparer<DependencyNodeCore<DependencyContextType>> filteredComparer)
++        {
++            var sortableNodes = new List<DependencyNodeCore<DependencyContextType>>(Math.Max(4, _markedNodes.Count / 8));
++            for (int i = 0; i < _markedNodes.Count; i++)
++            {
++                DependencyNodeCore<DependencyContextType> node = _markedNodes[i];
++                if (filteredComparer.ShouldSort(node))
++                {
++                    sortableNodes.Add(node);
++                }
++            }
++
++            sortableNodes.MergeSortAllowDuplicates(_resultSorter);
++
++            int destination = _markedNodes.Count - 1;
++            for (int i = _markedNodes.Count - 1; i >= 0; i--)
++            {
++                DependencyNodeCore<DependencyContextType> node = _markedNodes[i];
++                if (!filteredComparer.ShouldSort(node))
++                {
++                    _markedNodes[destination--] = node;
++                }
++            }
++
++            Debug.Assert(destination == sortableNodes.Count - 1);
++            for (int i = 0; i < sortableNodes.Count; i++)
++            {
++                _markedNodes[i] = sortableNodes[i];
++            }
++
++            IlcOptimizationExperiments.SetCounter("graph-filtered-sort-node-count", sortableNodes.Count);
++        }
++
+diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/ILCompiler.DependencyAnalysisFramework.csproj b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/ILCompiler.DependencyAnalysisFramework.csproj
+index 28aa33b5a..f18ba405e 100644
+--- a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/ILCompiler.DependencyAnalysisFramework.csproj
++++ b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/ILCompiler.DependencyAnalysisFramework.csproj
+@@ -31,0 +32 @@
++    <Compile Include="IlcOptimizationExperiments.cs" />
+diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs
+new file mode 100644
+index 000000000..158d738e1
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/IlcOptimizationExperiments.cs
+@@ -0,0 +1,161 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++
++namespace ILCompiler.DependencyAnalysisFramework
++{
++    public static class IlcOptimizationExperiments
++    {
++        private static readonly char[] s_experimentSeparators = new char[] { ',', ';', ' ' };
++        private static readonly HashSet<string> s_enabledExperiments = GetEnabledExperiments();
++        private static readonly bool s_metricsEnabled =
++            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DOTNET_ILC_PROFILE_PATH"));
++        private static readonly object s_metricsLock = new object();
++        private static readonly Dictionary<string, Timing> s_phaseTimings = new Dictionary<string, Timing>(StringComparer.Ordinal);
++        private static readonly Dictionary<string, long> s_counters = new Dictionary<string, long>(StringComparer.Ordinal);
++
++        public static bool MetricsEnabled => s_metricsEnabled;
++
++        public static bool IsEnabled(string name)
++        {
++            return s_enabledExperiments.Contains(name);
++        }
++
++        public static string[] GetEnabledExperimentNames()
++        {
++            var names = new string[s_enabledExperiments.Count];
++            s_enabledExperiments.CopyTo(names);
++            Array.Sort(names, StringComparer.Ordinal);
++            return names;
++        }
++
++        public static long GetTimestamp()
++        {
++            return s_metricsEnabled ? Stopwatch.GetTimestamp() : 0;
++        }
++
++        public static void RecordPhase(string name, long startTimestamp)
++        {
++            if (!s_metricsEnabled || startTimestamp == 0)
++            {
++                return;
++            }
++
++            long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
++            lock (s_metricsLock)
++            {
++                s_phaseTimings.TryGetValue(name, out Timing timing);
++                timing.Add(elapsedTicks);
++                s_phaseTimings[name] = timing;
++            }
++        }
++
++        public static void SetCounter(string name, long value)
++        {
++            if (!s_metricsEnabled)
++            {
++                return;
++            }
++
++            lock (s_metricsLock)
++            {
++                s_counters[name] = value;
++            }
++        }
++
++        public static PhaseMetric[] GetPhaseMetrics()
++        {
++            lock (s_metricsLock)
++            {
++                var result = new PhaseMetric[s_phaseTimings.Count];
++                int index = 0;
++                foreach (KeyValuePair<string, Timing> pair in s_phaseTimings)
++                {
++                    result[index++] = new PhaseMetric(pair.Key, pair.Value.Count, pair.Value.TotalTicks, pair.Value.MaxTicks);
++                }
++                return result;
++            }
++        }
++
++        public static CounterMetric[] GetCounters()
++        {
++            lock (s_metricsLock)
++            {
++                var result = new CounterMetric[s_counters.Count];
++                int index = 0;
++                foreach (KeyValuePair<string, long> pair in s_counters)
++                {
++                    result[index++] = new CounterMetric(pair.Key, pair.Value);
++                }
++                return result;
++            }
++        }
++
++        private static HashSet<string> GetEnabledExperiments()
++        {
++            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++            string value = Environment.GetEnvironmentVariable("DOTNET_ILC_EXPERIMENTS");
++            if (string.IsNullOrWhiteSpace(value))
++            {
++                return result;
++            }
++
++            foreach (string name in value.Split(s_experimentSeparators, StringSplitOptions.RemoveEmptyEntries))
++            {
++                result.Add(name);
++            }
++
++            return result;
++        }
++
++        private struct Timing
++        {
++            public long Count;
++            public long TotalTicks;
++            public long MaxTicks;
++
++            public void Add(long ticks)
++            {
++                Count++;
++                TotalTicks += ticks;
++                MaxTicks = Math.Max(MaxTicks, ticks);
++            }
++        }
++
++        public readonly struct PhaseMetric
++        {
++            public PhaseMetric(string name, long count, long totalTicks, long maxTicks)
++            {
++                Name = name;
++                Count = count;
++                TotalTicks = totalTicks;
++                MaxTicks = maxTicks;
++            }
++
++            public string Name { get; }
++            public long Count { get; }
++            public long TotalTicks { get; }
++            public long MaxTicks { get; }
++        }
++
++        public readonly struct CounterMetric
++        {
++            public CounterMetric(string name, long value)
++            {
++                Name = name;
++                Value = value;
++            }
++
++            public string Name { get; }
++            public long Value { get; }
++        }
++    }
++
++    public interface IFilteredDependencyNodeComparer<T> : IComparer<T>
++    {
++        bool ShouldSort(T value);
++    }
++}
 diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
 index 98b214e2b..494814f02 100644
 --- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs

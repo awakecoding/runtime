@@ -34,6 +34,14 @@ batch was running and a maximum of 19. In the low-overhead run, 419.556 seconds,
 graph/codegen wall time, was outside the parallel method batches. Increasing existing method
 parallelism is therefore unlikely to materially improve total build time.
 
+Three optimization waves tested 15 full-RDM hypotheses. The final accepted set reduced
+managed allocation by 2.634 GiB (-2.31%) against its bracket midpoint, graph time by
+1.865 seconds, and mark-stack time by 3.230 seconds. Total wall fell 4.131 seconds (-0.68%),
+which is below the shared-machine variance floor and is not presented as an expected build
+speedup. The strongest new standalone result was concrete dependency-list iteration:
+170.0 million entries avoided interface enumeration, cutting 1.35-1.39 GiB of allocation and
+about 7.3 seconds from graph/mark time.
+
 ## Exact baseline
 
 | Item | Value |
@@ -460,6 +468,148 @@ executable with SHA-256
 The reconstructed v10.0.11 compiler build succeeded, and
 `ILCompiler.Compiler.Tests` passed 21 of 21 tests.
 
+## Wave 3 optimization experiments
+
+Wave 3 started from the cumulative Wave 1+2 base:
+
+```text
+compact-section-data;lazy-relocation-lists;string-table-hashset;compact-coff-relocations
+```
+
+Six initial hypotheses and replacements were screened in 22 interleaved EntryModel runs.
+Every output was byte-identical. Screening rejected incremental dynamic-dependency scanning
+(only 134 provider visits), reference-equality conditional keys, one-lookup mangled-name
+caching, stopping object traversal at the sorted non-object tail, flat and inline compact
+symbolic-relocation representations, and a segmented mark stack. The latter representations
+confirmed that per-section overcapacity and indirection can cost more than the heap objects
+they remove.
+
+The final five candidates all received full RDM runs. Wave 3 controls and variants produced
+the same 3,744,339,247-byte object with SHA-256
+`C71AA7E9BAC37D9F2A2B2E2D75C695947D70CBD4EE39464C3623C4C9A8B75668`.
+The node, section, symbol, relocation, and output-byte counts were identical.
+
+| Hypothesis | Full-scale cardinality | Measured result | Verdict |
+| --- | ---: | --- | --- |
+| Concrete dependency-list iteration | 28.536M static lists/96.861M entries; 6.715M conditional lists/73.188M entries | Graph and mark each fell about 7.3 s versus A/B midpoint; allocation fell 1.35-1.39 GiB | **Win: graph time and memory** |
+| Reference-backed singleton conditional buckets | 5.724M buckets; 1.189M promoted | Allocation fell 0.66-0.71 GiB in both runs. Frequency-matched confirmation cut graph 6.76 s and mark 9.12 s; first run was frequency-confounded | **Win: memory; provisional graph time** |
+| Planned symbolic-relocation capacities | 46.784M relocation candidates; 41.019M emitted records; planning pass 0.36 s | Allocation fell 0.47-0.53 GiB; object time was -1.55 s versus B/C midpoint but resolution was +1.15 s | **Win: memory; timing neutral** |
+| Exact compact COFF capacities | 41.019M records | Allocation fell 0.95-1.01 GiB, but peak private memory rose 1.45-1.91 GiB in its bracket and 1.61 GiB in confirmation; targeted timing did not repeat | **Regression: reject on peak memory** |
+| Chunked relocation-block values | 7.777M records in 119 chunks | Allocation fell 0.20-0.23 GiB; object/materialization timing did not beat the C/D midpoint | **Neutral: exclude** |
+
+Symbolic capacities are per-section upper bounds computed from actual relocation arrays;
+locally resolved candidates account for the difference between the 46.784 million planned
+slots and 41.019 million emitted records. Compact COFF capacities are exact and are allocated
+only for used sections. Both avoid the regime-sensitive marked-node estimates rejected in
+Wave 1. Even so, lower cumulative allocation does not guarantee lower peak commitment: exact
+compact COFF capacity changed collection timing enough to fail the explicit peak-memory guard.
+
+### Wave 3 full-run matrix
+
+| Run | Wall | Graph | Mark | Object | Allocation | Peak private |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control A | 592.87 s | 401.21 s | 356.54 s | 188.01 s | 114.09 GiB | 34.41 GiB |
+| Indexed dependency lists | 592.87 s | 396.41 s | 350.15 s | 192.30 s | 112.70 GiB | 33.82 GiB |
+| Reference conditional buckets | 620.07 s | 419.07 s | 372.13 s | 196.83 s | 113.39 GiB | 34.74 GiB |
+| Control B | 604.78 s | 406.28 s | 358.49 s | 194.44 s | 114.05 GiB | 35.72 GiB |
+| Exact symbolic capacity | 616.05 s | 421.09 s | 373.70 s | 191.53 s | 113.58 GiB | 35.61 GiB |
+| Exact compact capacity | 598.16 s | 408.70 s | 361.39 s | 185.14 s | 113.10 GiB | 37.17 GiB |
+| Control C | 618.38 s | 423.05 s | 376.53 s | 191.72 s | 114.11 GiB | 35.26 GiB |
+| Compact relocation blocks | 608.48 s | 410.30 s | 363.59 s | 194.80 s | 113.88 GiB | 34.24 GiB |
+| Control D | 598.29 s | 411.86 s | 366.08 s | 182.89 s | 114.08 GiB | 33.77 GiB |
+| Exact compact confirmation | 588.46 s | 401.57 s | 354.29 s | 182.80 s | 113.10 GiB | 35.38 GiB |
+| Conditional confirmation | 588.31 s | 405.10 s | 356.96 s | 179.37 s | 113.38 GiB | 36.88 GiB |
+
+### Final all-wave combination
+
+The final accepted set was:
+
+```text
+compact-section-data;lazy-relocation-lists;string-table-hashset;compact-coff-relocations;
+dependency-list-indexed-iteration;conditional-single-reference-bucket;
+exact-symbolic-relocation-capacity
+```
+
+Controls D and E bracketed the combined run. The combined run began at 85% reported maximum
+frequency, between D at 90% and E at 84%.
+
+| Metric | Control D/E midpoint | Combined | Change |
+| --- | ---: | ---: | ---: |
+| Total wall | 603.497 s | 599.366 s | -4.131 s (-0.68%) |
+| Graph and code generation | 408.416 s | 406.551 s | -1.865 s (-0.46%) |
+| Mark stack | 363.013 s | 359.783 s | -3.230 s (-0.89%) |
+| Deferred computation | 36.342 s | 36.635 s | +0.293 s (+0.81%) |
+| Object emission | 191.191 s | 189.275 s | -1.916 s (-1.00%) |
+| Node materialization | 111.327 s | 106.823 s | -4.504 s (-4.05%) |
+| Capacity planning | 0 s | 0.192 s | +0.192 s |
+| Relocation resolution | 18.929 s | 21.846 s | +2.917 s (+15.41%) |
+| Object file write | 44.936 s | 44.462 s | -0.474 s (-1.05%) |
+| Managed allocation | 114.104 GiB | 111.470 GiB | -2.634 GiB (-2.31%) |
+
+Peak private memory was 35.611 GiB versus 33.766/34.514 GiB in the controls. The higher peak
+was transient late in object writing. Phase-aligned samples were lower than control D at graph
+end (16.69 versus 17.20 GiB), materialization end (28.90 versus 29.89 GiB), and object end
+(32.16 versus 33.62 GiB). The result is therefore retained-heap/GC-shape variability rather
+than evidence of higher cumulative allocation, but it remains a deployment-capacity caveat.
+
+The final object linked successfully in 53.89 seconds to a 1,038,627,840-byte executable with
+SHA-256 `D009CB3EDF31E457C93C6FE99520A53F64C26D7CD39F58A57624A3CB9E854819`.
+The executable remained alive through a 20-second GUI startup smoke test and was then stopped
+by its exact process ID. The compiler build succeeded and `ILCompiler.Compiler.Tests` passed
+21 of 21 tests with the accepted gates enabled. The profiled compiler `ilc.dll` SHA-256 was
+`5B7631836D6C43746DBF638299C348E163D0F0E70A58450CDFB5EA47D0863E45`.
+After review-only fixes to rejected/combined-only paths, the rebuilt `ilc.dll` SHA-256 is
+`5ED0F11545AB936623848A0EEADF66296FFAC0C4973CAF7A9F241A58EBF74700`; it reproduced the
+accepted EntryModel object's exact 95,437,303-byte
+`1CCCD378360DC0F9B1766083060B24F7BC593CEE42F1C70DC9F80687D2A507BC` hash.
+
+Raw profiles are under `artifacts\nativeaot-profile\experiments\wave3-full-rdm`; the summary is
+`artifacts\nativeaot-profile\experiments\wave3-full-rdm-summary.csv`. Link and smoke evidence
+are in `11-combined-all-waves\link-metadata.json` and `smoke-metadata.json`.
+
+## Fifteen-experiment verdict ledger
+
+| Wave | Experiment | Verdict |
+| --- | --- | --- |
+| 1 | Filtered final graph sort | Regression |
+| 1 | Null-interner fast path | Neutral |
+| 1 | Lazy per-section state | Win: allocation and modest object time |
+| 1 | Eager object-writer preallocation | Neutral/unstable |
+| 1 | Hash-based COFF string reservation | Win: targeted string-reservation time |
+| 2 | Conditional singleton value bucket | Regression |
+| 2 | Batched COFF writes | Neutral |
+| 2 | Fast long-name classification | Regression |
+| 2 | Compact COFF relocations | Win: allocation; wall neutral |
+| 2 | Compact COFF symbols | Regression despite lower allocation |
+| 3 | Concrete dependency-list iteration | Win: graph time and allocation |
+| 3 | Reference-backed conditional bucket | Win: allocation; provisional graph time |
+| 3 | Planned symbolic-relocation capacity | Win: allocation; timing neutral |
+| 3 | Exact compact COFF capacity | Rejected: peak-memory regression |
+| 3 | Compact relocation blocks | Neutral; modest allocation only |
+
+### Priorities after three waves
+
+1. **Reduce dependency graph construction and allocation.** It remains about 405-410 seconds.
+   The concrete-iteration win shows that collection API shape matters at 170 million edges.
+   Return concrete/span-compatible dependency collections, avoid boxed enumerators, and
+   profile node-factory/interning allocations by type before attempting broader parallelism.
+2. **Reduce RDM roots.** Generated ViewLocator registrations, serializer breadth, and optional
+   Graph/OpenXML/AI modules multiply the graph itself. Compiler improvements make every node
+   cheaper; removing unnecessary roots avoids all downstream graph, metadata, code, symbol,
+   relocation, and link work.
+3. **Stream deterministic object materialization.** The accepted object changes save
+   allocation, but 13.455 million object nodes, 18.258 million symbols, and 41.019 million COFF
+   relocations remain live enough for GC and file-cache effects to dominate. Partitioned
+   preparation followed by deterministic streaming has a larger ceiling than additional tiny
+   name or write fast paths.
+4. **Prototype cross-run caching.** The single giant object prevents reuse. A correctness-keyed
+   cache for method/object fragments and dependency facts has the largest repeat-build ceiling,
+   but requires architectural work around reflection, generic dictionaries, and deterministic
+   merging.
+5. **Do not prioritize method-worker or linker tuning.** Method batches remain a small,
+   already-parallel fraction; linking remains tens of seconds. Neither addresses the measured
+   serial graph and object costs.
+
 ## Reproduction
 
 1. Check out runtime tag `v10.0.11`.
@@ -472,7 +622,9 @@ The reconstructed v10.0.11 compiler build succeeded, and
    gates with `-Experiments`, for example:
 
    ```powershell
-   -Experiments lazy-relocation-lists,compact-section-data,string-table-hashset
+   -Experiments lazy-relocation-lists,compact-section-data,string-table-hashset,`
+       compact-coff-relocations,dependency-list-indexed-iteration,`
+       conditional-single-reference-bucket,exact-symbolic-relocation-capacity
    ```
 
 6. Run `Analyze-IlcProfile.ps1` to produce compact CSV summaries.

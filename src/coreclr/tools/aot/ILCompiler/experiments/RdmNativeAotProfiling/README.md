@@ -43,7 +43,7 @@ speedup. The strongest new standalone result was concrete dependency-list iterat
 about 7.3 seconds from graph/mark time.
 
 For a strictly gated body-only edit, retaining the completed graph changes the result
-completely: the hardened RDM object patch took 254.251 ms and reproduced the independent
+completely: the final reviewed RDM object patch took 291.837 ms and reproduced the independent
 clean object's SHA-256 exactly. The unchanged native link still takes 36.55 seconds, so the
 measured end-to-end edit/link loop is about 36.8 seconds instead of roughly 10-11 minutes.
 
@@ -696,11 +696,13 @@ The tiny matrix validated:
 
 Unit tests additionally cover changed object size, alignment, defined symbols, relocation
 target/addend, GC info, frame info/count, EH state, COMDAT, missing/out-of-bounds location,
-duplicate node, overlapping patch offsets, an unexpected base byte, and an existing output.
-The final compiler test run passed all 40 tests. Separate wrapper checks confirmed a
+duplicate node, overlapping patch offsets, changed or unchanged fragment bytes in the base
+object, and an existing output. The final compiler test run passed all 41 tests. Separate
+wrapper checks confirmed a
 clean-validated incremental hit, ambient environment isolation, and a response-semantics
-clean fallback. Direct negative runs confirmed explicit MVID and optimized-configuration
-fallbacks.
+clean fallback. It also verifies that each response actually names its corresponding input
+assembly. Direct negative runs confirmed explicit MVID and optimized-configuration fallbacks.
+Unsafe-body-shape experiments cannot disable independent clean-object validation.
 
 ### Full object re-emission
 
@@ -722,9 +724,10 @@ relocations, and file writing.
 For non-COMDAT methods with unchanged code size, alignment, defined symbols, relocations,
 relocation addends, GC info, unwind/frame info, and no EH/debug data, the prototype records
 the changed node's file location during the baseline emission. An incremental request copies
-the cached object and patches only changed non-relocation bytes after confirming the cached
-bytes at those offsets still match. It writes and flushes a temporary object, closes it, and
-atomically moves it to the result path before reporting success.
+the cached object and patches only changed non-relocation bytes after confirming every
+non-relocation byte in the recorded dirty-method fragment still matches. It writes and flushes
+a temporary object, closes it, and atomically moves it to the result path before reporting
+success.
 
 The controlled RDM edit changed one `ldc.i4.s` operand in reachable
 `Program.BuildModuleViewIndex`. The dirty RDM worktree was not modified; the changed DLL was
@@ -732,31 +735,33 @@ created under `artifacts`. This real-workload candidate required the explicitly 
 unsafe-body-shape switch; the evidence for accepting the result is the post-codegen state
 guards plus exact identity with an independent clean v2 object, not the strict leaf whitelist.
 
-The first measured path took 180.848 ms before review. Adding original-byte validation and
-atomic temporary-file persistence produced this final hardened result:
+The first measured path took 180.848 ms before review. Atomic persistence and initial
+patch-byte validation raised that to 254.251 ms. The final rubber-duck review preserved the
+effective IL provider, including generated P/Invoke stubs, verified the complete recorded
+non-relocation fragment, and made unsafe-shape mode require a clean differential compile:
 
-| Metric | Hardened fast-path result |
+| Metric | Final reviewed fast-path result |
 | --- | ---: |
-| Clean v2 ILC | 619.125 s |
-| Incremental update | 254.251 ms |
-| Speedup | 2,435.09x |
-| Reduction | 99.9589% |
-| Shape validation | 8.336 ms |
-| Retained changed-node lookup | 5.790 ms |
-| Code generation | 19.536 ms |
-| Dependency/code-state validation | 4.026 ms |
-| Durable atomic object copy/patch | 171.533 ms |
+| Matched clean v2 ILC | 640.395 s |
+| Incremental update | 291.837 ms |
+| Speedup | 2,194.36x |
+| Reduction | 99.9544% |
+| Shape validation | 13.968 ms |
+| Retained changed-node lookup | 17.310 ms |
+| Code generation | 33.710 ms |
+| Dependency/code-state validation | 6.665 ms |
+| Durable atomic object copy/patch | 175.045 ms |
 | Patched bytes | 1 |
-| Incremental managed allocation | 1,571,776 bytes |
+| Incremental managed allocation | 1,568,736 bytes |
 | Object nodes reused | 13,455,307 of 13,455,308 |
-| Private bytes before/after | 36,319,535,104 / 36,320,284,672 (+749,568) |
+| Private bytes before/after | 37,742,915,584 / 37,745,176,576 (+2,260,992) |
 
 The incremental object exactly matched clean v2 with SHA-256
 `B3140045782498DC4A06F712C2DAA329B732D6340DFCD3D80AD4181E17844206`.
 A fresh process confirmed that the hardened compiler was
-`D88A7AB04D52FB51447EEAA4467A5C276AB4B2483BB0555E539715A6A3534724`
+`1418D52E3C46B4E292C0C741C4DC69D99932531953EFA6379691B6F201740C50`
 (`ilc.dll` SHA-256).
-A fresh PowerShell process reread and hashed the 3.744 GB object in 2.42 seconds. This verifies
+A fresh PowerShell process reread and hashed the 3.744 GB object in 2.75 seconds. This verifies
 persistence, but the readback was still subject to the operating-system file cache and is not
 presented as cold-storage throughput.
 
@@ -791,19 +796,23 @@ are unchanged, and symbolic object fragments can avoid almost all re-emission wo
 
 The next engineering step is a real idle-timeout ILC daemon or worker protocol that retains
 the approximately 34-36 GiB compiler state between MSBuild invocations. It must preserve the
-same strict fallback contract, support compiler/configuration cache invalidation, and decide
-how to invalidate and rebuild MVID-dependent metadata; the current prototype rejects any MVID
-change.
+same strict fallback contract, key compiler/JIT/configuration/reference/resource contents and
+relevant environment state, isolate process-global caches per request, and decide how to
+invalidate and rebuild MVID-dependent metadata; the current prototype rejects any MVID change.
 Broader edits require tracked inlining, preinitialization, reflection, generic, debug, COMDAT,
-and global-table invalidation before they can enter the fast path.
+and global-table invalidation before they can enter the fast path. Fast patching currently
+records only the first request's dirty nodes, so a later request touching a newly dirty method
+falls back. Only the object is differentially compared; link-affecting side outputs such as an
+exports file need their own regeneration or validation contract.
 
 Raw evidence is under `artifacts\nativeaot-profile\incremental`. The main files are:
 
 * `rdm-incremental-summary.csv`;
 * `matrix-runs\matrix-results.csv`;
 * `hardening-results.csv`;
-* `rdm-fast-patch-hardened\incremental-result.json`;
-* `rdm-fast-patch-hardened\incremental-attempt\ilc-profile.csv`;
+* `rdm-rubber-duck-final\incremental-result.json`;
+* `rdm-rubber-duck-final\incremental-attempt\ilc-profile.csv`;
+* `rdm-rubber-duck-final\clean-validation\run-metadata.json`;
 * `rdm-fast-patch-hardened\incremental-attempt\link-smoke-metadata.json`;
 * `entrymodel-hardened-sequential-gc\ilc-profile.csv`;
 * `tiny-hardened-revert\ilc-profile.csv`.
@@ -844,9 +853,10 @@ For an incremental prototype invocation, use:
 
 Omit `-FastObjectPatch` to benchmark graph reuse with complete object re-emission. The runner
 compares every incremental hit to an independent clean updated build by default and fails on
-any object mismatch. Pass `-SkipCleanValidation` only for a timing run that is already paired
-with a separately verified clean control. An explicit compiler or response-semantics fallback
-automatically runs the clean updated build.
+any object mismatch. Strict-shape timing runs may pass `-SkipCleanValidation` only when already
+paired with a separately verified clean control; unsafe-shape mode cannot bypass clean
+validation. An explicit compiler or response-semantics fallback automatically runs the clean
+updated build.
 
 Bulky profile outputs belong under `artifacts/` or another ignored directory, not source
 control.

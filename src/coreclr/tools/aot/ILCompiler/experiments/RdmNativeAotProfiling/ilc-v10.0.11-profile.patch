@@ -136,10 +136,10 @@ index 000000000..31169dc6f
 +}
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs
 new file mode 100644
-index 000000000..6ba66efc6
+index 000000000..42a093da9
 --- /dev/null
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,259 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -185,18 +185,23 @@ index 000000000..6ba66efc6
 +
 +        [Theory]
 +        [InlineData("base-byte", "base-object-byte-does-not-match-recorded-fragment")]
++        [InlineData("base-unchanged-byte", "base-object-byte-does-not-match-recorded-fragment")]
 +        [InlineData("existing-output", "patched-object-output-already-exists")]
 +        public void RejectsUnsafeDestinationState(string change, string expectedReason)
 +        {
 +            using var files = new TemporaryFiles();
-+            var node = new TestObjectNode(new byte[] { 1 });
++            var node = new TestObjectNode(new byte[] { 1, 2 });
 +            Record(node, fileOffset: 10);
 +            if (change == "existing-output")
 +            {
 +                files.WriteBaseBytes(10, node.GetData(factory: null).Data);
 +                File.WriteAllBytes(files.OutputPath, new byte[] { 42 });
 +            }
-+            node.SetData(new byte[] { 9 });
++            else if (change == "base-unchanged-byte")
++            {
++                files.WriteBaseBytes(10, new byte[] { 1, 8 });
++            }
++            node.SetData(new byte[] { 9, 2 });
 +
 +            Assert.False(IncrementalObjectPatch.TryPatch(
 +                files.BasePath,
@@ -2103,10 +2108,10 @@ index d6deb2760..341d8169f 100644
 +
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs
 new file mode 100644
-index 000000000..e62879466
+index 000000000..08401ddf2
 --- /dev/null
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,421 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -2193,6 +2198,7 @@ index 000000000..e62879466
 +            }
 +
 +            var patches = new List<Patch>();
++            var verificationRanges = new List<VerificationRange>();
 +            var seenNodes = new HashSet<ObjectNode>();
 +            if (!TryGetObjectLength(baseObjectPath, out long baseObjectLength, out reason))
 +            {
@@ -2247,6 +2253,7 @@ index 000000000..e62879466
 +                }
 +
 +                bool[] relocationBytes = GetRelocationBytes(updatedData.Data.Length, updatedData.Relocs);
++                verificationRanges.Add(new VerificationRange(entry.FileOffset, entry.Data, relocationBytes));
 +                for (int i = 0; i < updatedData.Data.Length; i++)
 +                {
 +                    if (entry.Data[i] == updatedData.Data[i])
@@ -2259,7 +2266,7 @@ index 000000000..e62879466
 +                        return false;
 +                    }
 +
-+                    patches.Add(new Patch(entry.FileOffset + i, entry.Data[i], updatedData.Data[i]));
++                    patches.Add(new Patch(entry.FileOffset + i, updatedData.Data[i]));
 +                }
 +            }
 +
@@ -2277,6 +2284,7 @@ index 000000000..e62879466
 +                baseObjectPath,
 +                outputObjectPath,
 +                baseObjectLength,
++                verificationRanges,
 +                patches,
 +                out reason))
 +            {
@@ -2292,6 +2300,7 @@ index 000000000..e62879466
 +            string baseObjectPath,
 +            string outputObjectPath,
 +            long baseObjectLength,
++            List<VerificationRange> verificationRanges,
 +            List<Patch> patches,
 +            out string reason)
 +        {
@@ -2310,13 +2319,22 @@ index 000000000..e62879466
 +                    FileAccess.Read,
 +                    FileShare.Read))
 +                {
-+                    foreach (Patch patch in patches)
++                    foreach (VerificationRange range in verificationRanges)
 +                    {
-+                        baseStream.Position = patch.Offset;
-+                        if (baseStream.ReadByte() != patch.ExpectedValue)
++                        baseStream.Position = range.Offset;
++                        for (int i = 0; i < range.Data.Length; i++)
 +                        {
-+                            reason = "base-object-byte-does-not-match-recorded-fragment";
-+                            return false;
++                            int value = baseStream.ReadByte();
++                            if (value < 0)
++                            {
++                                reason = "base-object-fragment-ended-unexpectedly";
++                                return false;
++                            }
++                            if (!range.RelocationBytes[i] && value != range.Data[i])
++                            {
++                                reason = "base-object-byte-does-not-match-recorded-fragment";
++                                return false;
++                            }
 +                        }
 +                    }
 +                }
@@ -2490,16 +2508,28 @@ index 000000000..e62879466
 +
 +        private readonly struct Patch
 +        {
-+            public Patch(long offset, byte expectedValue, byte value)
++            public Patch(long offset, byte value)
 +            {
 +                Offset = offset;
-+                ExpectedValue = expectedValue;
 +                Value = value;
 +            }
 +
 +            public long Offset { get; }
-+            public byte ExpectedValue { get; }
 +            public byte Value { get; }
++        }
++
++        private readonly struct VerificationRange
++        {
++            public VerificationRange(long offset, byte[] data, bool[] relocationBytes)
++            {
++                Offset = offset;
++                Data = data;
++                RelocationBytes = relocationBytes;
++            }
++
++            public long Offset { get; }
++            public byte[] Data { get; }
++            public bool[] RelocationBytes { get; }
 +        }
 +    }
 +}
@@ -4699,7 +4729,7 @@ index 000000000..f6c9229d6
 +    }
 +}
 diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
-index 98b214e2b..9844901c8 100644
+index 98b214e2b..2780947d7 100644
 --- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
 @@ -6,0 +7,2 @@
@@ -4713,7 +4743,7 @@ index 98b214e2b..9844901c8 100644
 @@ -47,0 +54 @@ internal RyuJitCompilation(
 +            string incrementalBodyUpdateUnsupportedReason,
 @@ -54,0 +62,2 @@ internal RyuJitCompilation(
-+            _incrementalBaseILProvider = ilProvider;
++            _incrementalBaseILProvider = CurrentILProvider;
 +            _incrementalBodyUpdateUnsupportedReason = incrementalBodyUpdateUnsupportedReason;
 @@ -101,0 +111,3 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.SetCounter("configured-parallelism", _parallelism);

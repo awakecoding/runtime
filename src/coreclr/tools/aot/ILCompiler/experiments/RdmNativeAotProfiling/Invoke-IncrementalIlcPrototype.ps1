@@ -43,6 +43,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if ($AllowUnsafeBodyShapesForTesting -and $SkipCleanValidation)
+{
+    throw '-AllowUnsafeBodyShapesForTesting requires clean differential validation.'
+}
+
 $ilcPath = (Resolve-Path -LiteralPath $IlcPath).Path
 $baseResponseFile = (Resolve-Path -LiteralPath $BaseResponseFile).Path
 $updatedResponseFile = (Resolve-Path -LiteralPath $UpdatedResponseFile).Path
@@ -83,8 +88,6 @@ foreach ($name in $environmentNames)
         Value = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
 }
-
-New-Item -ItemType Directory -Path $runRoot | Out-Null
 
 function Get-NormalizedResponse
 {
@@ -174,6 +177,21 @@ function Clear-IncrementalEnvironment
 
 $normalizedBaseResponse = Get-NormalizedResponse -Path $baseResponseFile
 $normalizedUpdatedResponse = Get-NormalizedResponse -Path $updatedResponseFile
+$baseResponseText = Get-Content -LiteralPath $baseResponseFile -Raw
+$updatedResponseText = Get-Content -LiteralPath $updatedResponseFile -Raw
+if (!$baseResponseText.Contains(
+    $baseAssembly,
+    [StringComparison]::OrdinalIgnoreCase))
+{
+    throw 'Base response does not reference the base assembly.'
+}
+if (!$updatedResponseText.Contains(
+    $updatedAssembly,
+    [StringComparison]::OrdinalIgnoreCase))
+{
+    throw 'Updated response does not reference the updated assembly.'
+}
+
 $responseFallbackReason = if ($normalizedBaseResponse -ne $normalizedUpdatedResponse)
 {
     'response-semantics-changed'
@@ -182,6 +200,8 @@ else
 {
     $null
 }
+
+New-Item -ItemType Directory -Path $runRoot | Out-Null
 
 try
 {

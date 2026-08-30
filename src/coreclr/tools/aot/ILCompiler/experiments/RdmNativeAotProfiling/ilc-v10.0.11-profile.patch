@@ -55,6 +55,357 @@ index 1b772684d..40d1d04f8 100644
 @@ -157 +186 @@ public LockFreeReaderHashtable()
 -                int lastBit = _initialSize >> i;
 +                int lastBit = initialSize >> i;
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/ILCompiler.Compiler.Tests.csproj b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/ILCompiler.Compiler.Tests.csproj
+index 69e9d8763..e8c348879 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/ILCompiler.Compiler.Tests.csproj
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/ILCompiler.Compiler.Tests.csproj
+@@ -44,0 +45,2 @@
++    <Compile Include="IncrementalCodeStateValidatorTests.cs" />
++    <Compile Include="IncrementalObjectPatchTests.cs" />
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalCodeStateValidatorTests.cs b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalCodeStateValidatorTests.cs
+new file mode 100644
+index 000000000..31169dc6f
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalCodeStateValidatorTests.cs
+@@ -0,0 +1,66 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using ILCompiler.DependencyAnalysis;
++
++using Xunit;
++
++namespace ILCompiler.Compiler.Tests
++{
++    public class IncrementalCodeStateValidatorTests
++    {
++        [Fact]
++        public void AcceptsEquivalentCodeState()
++        {
++            FrameInfo[] frames =
++            {
++                new FrameInfo(default, 0, 10, new byte[] { 1, 2 }),
++            };
++
++            Assert.True(IncrementalCodeStateValidator.Matches(
++                frames,
++                new byte[] { 3, 4 },
++                oldHasEhInfo: false,
++                frames,
++                new byte[] { 3, 4 },
++                newHasEhInfo: false,
++                out string reason), reason);
++        }
++
++        [Theory]
++        [InlineData("old-eh")]
++        [InlineData("new-eh")]
++        [InlineData("gc")]
++        [InlineData("frame-count")]
++        [InlineData("frame")]
++        public void RejectsChangedCodeState(string change)
++        {
++            FrameInfo[] oldFrames =
++            {
++                new FrameInfo(default, 0, 10, new byte[] { 1, 2 }),
++            };
++            FrameInfo[] newFrames =
++            {
++                new FrameInfo(
++                    change == "frame" ? FrameInfoFlags.Handler : default,
++                    0,
++                    10,
++                    new byte[] { 1, 2 }),
++            };
++            if (change == "frame-count")
++            {
++                newFrames = System.Array.Empty<FrameInfo>();
++            }
++
++            Assert.False(IncrementalCodeStateValidator.Matches(
++                oldFrames,
++                new byte[] { 3, 4 },
++                oldHasEhInfo: change == "old-eh",
++                newFrames,
++                change == "gc" ? new byte[] { 3, 5 } : new byte[] { 3, 4 },
++                newHasEhInfo: change == "new-eh",
++                out string reason));
++            Assert.False(string.IsNullOrEmpty(reason));
++        }
++    }
++}
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs
+new file mode 100644
+index 000000000..6ba66efc6
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler.Tests/IncrementalObjectPatchTests.cs
+@@ -0,0 +1,254 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++
++using ILCompiler.DependencyAnalysis;
++using ILCompiler.ObjectWriter;
++
++using Internal.Text;
++
++using Xunit;
++
++namespace ILCompiler.Compiler.Tests
++{
++    public class IncrementalObjectPatchTests
++    {
++        [Fact]
++        public void PatchesSingleByteAndPersistsOutput()
++        {
++            using var files = new TemporaryFiles();
++            var node = new TestObjectNode(new byte[] { 1, 2, 3 });
++            Record(node, fileOffset: 10);
++            files.WriteBaseBytes(10, node.GetData(factory: null).Data);
++            node.SetData(new byte[] { 1, 9, 3 });
++
++            Assert.True(IncrementalObjectPatch.TryPatch(
++                files.BasePath,
++                files.OutputPath,
++                new[] { node },
++                factory: null,
++                out string reason,
++                out long patchedByteCount), reason);
++            Assert.Equal(1, patchedByteCount);
++
++            byte[] result = File.ReadAllBytes(files.OutputPath);
++            byte[] expected = new byte[64];
++            expected[10] = 1;
++            expected[11] = 9;
++            expected[12] = 3;
++            Assert.Equal(expected, result);
++        }
++
++        [Theory]
++        [InlineData("base-byte", "base-object-byte-does-not-match-recorded-fragment")]
++        [InlineData("existing-output", "patched-object-output-already-exists")]
++        public void RejectsUnsafeDestinationState(string change, string expectedReason)
++        {
++            using var files = new TemporaryFiles();
++            var node = new TestObjectNode(new byte[] { 1 });
++            Record(node, fileOffset: 10);
++            if (change == "existing-output")
++            {
++                files.WriteBaseBytes(10, node.GetData(factory: null).Data);
++                File.WriteAllBytes(files.OutputPath, new byte[] { 42 });
++            }
++            node.SetData(new byte[] { 9 });
++
++            Assert.False(IncrementalObjectPatch.TryPatch(
++                files.BasePath,
++                files.OutputPath,
++                new[] { node },
++                factory: null,
++                out string reason,
++                out _));
++            Assert.Equal(expectedReason, reason);
++        }
++
++        [Theory]
++        [InlineData("size")]
++        [InlineData("alignment")]
++        [InlineData("symbols")]
++        [InlineData("relocation-target")]
++        [InlineData("relocation-addend")]
++        public void RejectsChangedFragmentInputs(string change)
++        {
++            using var files = new TemporaryFiles();
++            var oldTarget = new TestObjectNode(new byte[] { 0 });
++            var node = new TestObjectNode(
++                new byte[12],
++                new[] { new Relocation(RelocType.IMAGE_REL_BASED_REL32, 2, oldTarget) });
++            Record(node, fileOffset: 10);
++
++            switch (change)
++            {
++                case "size":
++                    node.SetData(new byte[13]);
++                    break;
++                case "alignment":
++                    node.SetData(new byte[12], alignment: 2);
++                    break;
++                case "symbols":
++                    node.SetData(new byte[12], definedSymbols: new[] { oldTarget });
++                    break;
++                case "relocation-target":
++                    node.SetData(
++                        new byte[12],
++                        relocations: new[]
++                        {
++                            new Relocation(
++                                RelocType.IMAGE_REL_BASED_REL32,
++                                2,
++                                new TestObjectNode(new byte[] { 0 })),
++                        });
++                    break;
++                case "relocation-addend":
++                    byte[] changedData = new byte[12];
++                    changedData[3] = 1;
++                    node.SetData(
++                        changedData,
++                        relocations: new[]
++                        {
++                            new Relocation(RelocType.IMAGE_REL_BASED_REL32, 2, oldTarget),
++                        });
++                    break;
++            }
++
++            Assert.False(IncrementalObjectPatch.TryPatch(
++                files.BasePath,
++                files.OutputPath,
++                new[] { node },
++                factory: null,
++                out string reason,
++                out _));
++            Assert.False(string.IsNullOrEmpty(reason));
++            Assert.False(File.Exists(files.OutputPath));
++        }
++
++        [Theory]
++        [InlineData("missing")]
++        [InlineData("comdat")]
++        [InlineData("bounds")]
++        [InlineData("duplicate-node")]
++        [InlineData("overlap")]
++        public void RejectsInvalidObjectLocations(string change)
++        {
++            using var files = new TemporaryFiles();
++            var node = new TestObjectNode(new byte[] { 1 });
++            var secondNode = new TestObjectNode(new byte[] { 2 });
++
++            IncrementalObjectPatch.Begin(change == "overlap" ? new[] { node, secondNode } : new[] { node });
++            if (change != "missing")
++            {
++                IncrementalObjectPatch.Record(
++                    node,
++                    sectionIndex: 0,
++                    sectionOffset: 0,
++                    node.GetData(factory: null),
++                    isComdat: change == "comdat");
++                if (change == "overlap")
++                {
++                    IncrementalObjectPatch.Record(
++                        secondNode,
++                        sectionIndex: 0,
++                        sectionOffset: 0,
++                        secondNode.GetData(factory: null),
++                        isComdat: false);
++                }
++            }
++            IncrementalObjectPatch.Complete((_, _) => change == "bounds" ? 1000 : 10);
++
++            node.SetData(new byte[] { 9 });
++            secondNode.SetData(new byte[] { 9 });
++            ObjectNode[] changedNodes = change switch
++            {
++                "duplicate-node" => new ObjectNode[] { node, node },
++                "overlap" => new ObjectNode[] { node, secondNode },
++                _ => new ObjectNode[] { node },
++            };
++
++            Assert.False(IncrementalObjectPatch.TryPatch(
++                files.BasePath,
++                files.OutputPath,
++                changedNodes,
++                factory: null,
++                out string reason,
++                out _));
++            Assert.False(string.IsNullOrEmpty(reason));
++            Assert.False(File.Exists(files.OutputPath));
++        }
++
++        private static void Record(TestObjectNode node, long fileOffset)
++        {
++            IncrementalObjectPatch.Begin(new[] { node });
++            IncrementalObjectPatch.Record(
++                node,
++                sectionIndex: 0,
++                sectionOffset: 0,
++                node.GetData(factory: null),
++                isComdat: false);
++            IncrementalObjectPatch.Complete((_, _) => fileOffset);
++        }
++
++        private sealed class TestObjectNode : ObjectNode, ISymbolDefinitionNode
++        {
++            private ObjectData _data;
++
++            public TestObjectNode(byte[] data, Relocation[] relocations = null)
++            {
++                SetData(data, relocations);
++            }
++
++            public int Offset => 0;
++            public override bool IsShareable => false;
++            public override bool StaticDependenciesAreComputed => true;
++            public override int ClassCode => 0x647F3201;
++
++            public void SetData(
++                byte[] data,
++                Relocation[] relocations = null,
++                int alignment = 1,
++                ISymbolDefinitionNode[] definedSymbols = null)
++            {
++                _data = new ObjectData(
++                    data,
++                    relocations ?? Array.Empty<Relocation>(),
++                    alignment,
++                    definedSymbols ?? new ISymbolDefinitionNode[] { this });
++            }
++
++            public override ObjectData GetData(NodeFactory factory, bool relocsOnly = false) => _data;
++            public override ObjectNodeSection GetSection(NodeFactory factory) => ObjectNodeSection.ReadOnlyDataSection;
++            public void AppendMangledName(NameMangler nameMangler, Utf8StringBuilder sb) => sb.Append("test"u8);
++            protected override string GetName(NodeFactory factory) => "test";
++        }
++
++        private sealed class TemporaryFiles : IDisposable
++        {
++            private readonly string _directory =
++                Path.Combine(Path.GetTempPath(), "incremental-object-patch-" + Guid.NewGuid().ToString("N"));
++
++            public TemporaryFiles()
++            {
++                Directory.CreateDirectory(_directory);
++                File.WriteAllBytes(BasePath, new byte[64]);
++            }
++
++            public string BasePath => Path.Combine(_directory, "base.obj");
++            public string OutputPath => Path.Combine(_directory, "output.obj");
++
++            public void WriteBaseBytes(long offset, byte[] data)
++            {
++                using var stream = new FileStream(BasePath, FileMode.Open, FileAccess.Write, FileShare.None);
++                stream.Position = offset;
++                stream.Write(data);
++            }
++
++            public void Dispose()
++            {
++                Directory.Delete(_directory, recursive: true);
++            }
++        }
++    }
++}
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/Compilation.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/Compilation.cs
+index 4903b28ef..7947d92ff 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/Compilation.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/Compilation.cs
+@@ -86,0 +87,7 @@ public virtual MethodIL GetMethodIL(MethodDesc method)
++        protected ILProvider CurrentILProvider => _methodILCache.ILProvider;
++
++        protected void ReplaceILProviderForIncrementalCompilation(ILProvider ilProvider)
++        {
++            _methodILCache = new ILCache(ilProvider);
++        }
++
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/CompilerProfile.cs
 new file mode 100644
 index 000000000..a73c222b5
@@ -529,15 +880,63 @@ index 000000000..a73c222b5
 +        public MethodTiming Timing;
 +    }
 +}
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/ExternalReferencesTableNode.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/ExternalReferencesTableNode.cs
+index 86e2d14a0..539783cfd 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/ExternalReferencesTableNode.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/ExternalReferencesTableNode.cs
+@@ -87 +87,8 @@ public override ObjectData GetData(NodeFactory factory, bool relocsOnly = false)
+-            _insertedSymbolsDictionary = null;
++            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH")) ||
++                string.Equals(
++                    Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                    "1",
++                    StringComparison.Ordinal))
++            {
++                _insertedSymbolsDictionary = null;
++            }
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/GenericVirtualMethodTableNode.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/GenericVirtualMethodTableNode.cs
+index 3df07d158..5b250f4ca 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/GenericVirtualMethodTableNode.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/GenericVirtualMethodTableNode.cs
+@@ -132 +132,8 @@ public override ObjectData GetData(NodeFactory factory, bool relocsOnly = false)
+-            _gvmImplementations = null;
++            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH")) ||
++                string.Equals(
++                    Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                    "1",
++                    StringComparison.Ordinal))
++            {
++                _gvmImplementations = null;
++            }
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/InterfaceGenericVirtualMethodTableNode.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/InterfaceGenericVirtualMethodTableNode.cs
+index e1f432af8..0cf866a79 100644
+--- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/InterfaceGenericVirtualMethodTableNode.cs
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/InterfaceGenericVirtualMethodTableNode.cs
+@@ -223 +223,8 @@ public override ObjectData GetData(NodeFactory factory, bool relocsOnly = false)
+-            _interfaceGvmSlots = null;
++            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH")) ||
++                string.Equals(
++                    Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                    "1",
++                    StringComparison.Ordinal))
++            {
++                _interfaceGvmSlots = null;
++            }
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
-index 8afd930fb..b77b8a968 100644
+index 8afd930fb..bc6e78549 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/DependencyAnalysis/NodeFactory.cs
-@@ -163,0 +164,3 @@ protected struct NodeCache<TKey, TValue>
+@@ -74,0 +75,5 @@ public void SetMarkingComplete()
++        public bool CanFoldMethodBodyForIncrementalCompilation(MethodDesc method)
++        {
++            return ObjectInterner.CanFold(method);
++        }
++
+@@ -163,0 +169,3 @@ protected struct NodeCache<TKey, TValue>
 +            private const int ExperimentInitialCapacity = 1024;
 +            private static readonly bool s_capacityHintEnabled = IlcOptimizationExperiments.IsEnabled("node-cache-capacity-hint");
 +
-@@ -170 +173,7 @@ public NodeCache(Func<TKey, TValue> creator, IEqualityComparer<TKey> comparer)
+@@ -170 +178,7 @@ public NodeCache(Func<TKey, TValue> creator, IEqualityComparer<TKey> comparer)
 -                _cache = new ConcurrentDictionary<TKey, TValue>(comparer);
 +                _cache = s_capacityHintEnabled ?
 +                    new ConcurrentDictionary<TKey, TValue>(Environment.ProcessorCount, ExperimentInitialCapacity, comparer) :
@@ -546,7 +945,7 @@ index 8afd930fb..b77b8a968 100644
 +                {
 +                    IlcOptimizationExperiments.AddCounter("node-cache-capacity-hint-count", 1);
 +                }
-@@ -176 +185,10 @@ public NodeCache(Func<TKey, TValue> creator)
+@@ -176 +190,10 @@ public NodeCache(Func<TKey, TValue> creator)
 -                _cache = new ConcurrentDictionary<TKey, TValue>();
 +                _cache = s_capacityHintEnabled ?
 +                    new ConcurrentDictionary<TKey, TValue>(
@@ -589,7 +988,7 @@ index f54d68cf0..9b883e7b3 100644
 +            }
 +
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
-index d6deb2760..50edfae92 100644
+index d6deb2760..341d8169f 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/CoffObjectWriter.cs
 @@ -50 +50,30 @@ internal sealed class CoffObjectWriter : ObjectWriter
@@ -1057,7 +1456,7 @@ index d6deb2760..50edfae92 100644
 +                }
 +            }
 +        }
-@@ -367,2 +563,82 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
+@@ -367,2 +563,28 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
 -                    default:
 -                        throw new NotSupportedException("Unsupported architecture");
 +        private protected override void EmitInlineRelocations(
@@ -1088,7 +1487,7 @@ index d6deb2760..50edfae92 100644
 +                        (uint)(relocationList.Count + 1),
 +                        symbolTableIndex: 0,
 +                        type: 0);
-+                }
+@@ -369,0 +592,76 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
 +
 +                foreach (ref readonly CompactSymbolicRelocation relocation in relocationList)
 +                {
@@ -1142,7 +1541,10 @@ index d6deb2760..50edfae92 100644
 +                        (uint)relocation.Offset,
 +                        _symbolNameToIndex[relocation.SymbolName],
 +                        type);
-@@ -372,0 +649,37 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
++                }
++            }
++        }
++
 +        private void AddCoffRelocation(
 +            SectionDefinition section,
 +            uint virtualAddress,
@@ -1162,7 +1564,7 @@ index d6deb2760..50edfae92 100644
 +                    SymbolTableIndex = symbolTableIndex,
 +                    Type = type,
 +                });
-+            }
+@@ -370,0 +669,15 @@ private protected override void EmitRelocations(int sectionIndex, List<SymbolicR
 +            _coffRelocationCount++;
 +        }
 +
@@ -1178,8 +1580,6 @@ index d6deb2760..50edfae92 100644
 +            int capacity = relocationCount + (relocationCount > ushort.MaxValue ? 1 : 0);
 +            section.CompactRelocations = new List<CompactCoffRelocation>(capacity);
 +            _exactCompactRelocationCapacity += capacity;
-+        }
-+
 @@ -471 +784,11 @@ private protected override void EmitObjectFile(string objectFilePath)
 -            using var outputFileStream = new FileStream(objectFilePath, FileMode.Create);
 +            using FileStream outputFileStream = s_largeFileBufferEnabled ?
@@ -1249,12 +1649,14 @@ index d6deb2760..50edfae92 100644
 @@ -540 +882 @@ private protected override void EmitObjectFile(string objectFilePath)
 -                    section.Stream.CopyTo(outputFileStream);
 +                    section.Stream.CopyTo(outputStream);
-@@ -543 +885,11 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -543 +885 @@ private protected override void EmitObjectFile(string objectFilePath)
 -                if (section.Relocations.Count > 0)
 +                if (s_compactRelocationsEnabled)
-+                {
+@@ -545 +887 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    foreach (var relocation in section.Relocations)
 +                    if (section.CompactRelocations is not null)
-+                    {
+@@ -547 +889,11 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                        relocation.Write(outputFileStream);
 +                        foreach (CompactCoffRelocation relocation in section.CompactRelocations)
 +                        {
 +                            relocation.Write(outputStream);
@@ -1262,21 +1664,21 @@ index d6deb2760..50edfae92 100644
 +                    }
 +                }
 +                else if (section.Relocations is not null)
-@@ -545 +897 @@ private protected override void EmitObjectFile(string objectFilePath)
--                    foreach (var relocation in section.Relocations)
++                {
 +                    foreach (CoffRelocation relocation in section.Relocations)
-@@ -547 +899 @@ private protected override void EmitObjectFile(string objectFilePath)
--                        relocation.Write(outputFileStream);
++                    {
 +                        relocation.Write(outputStream);
 @@ -550,0 +903 @@ private protected override void EmitObjectFile(string objectFilePath)
 +            IlcOptimizationExperiments.RecordPhase("coff-content-write", contentWriteStart);
-@@ -553 +906,12 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -553 +906,2 @@ private protected override void EmitObjectFile(string objectFilePath)
 -            foreach (var coffSymbolRecord in _symbols)
 +            long stringReserveStart = IlcOptimizationExperiments.GetTimestamp();
 +            if (s_compactSymbolsEnabled)
-+            {
+@@ -555 +909 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                if (coffSymbolRecord is CoffSymbol coffSymbol)
 +                foreach (ref readonly CompactCoffSymbolRecord symbol in _compactSymbols)
-+                {
+@@ -557 +911,14 @@ private protected override void EmitObjectFile(string objectFilePath)
+-                    stringTable.ReserveString(coffSymbol.Name);
 +                    if (!symbol.IsAuxiliary)
 +                    {
 +                        stringTable.ReserveString(symbol.Name);
@@ -1284,11 +1686,9 @@ index d6deb2760..50edfae92 100644
 +                }
 +            }
 +            else
-@@ -555 +919 @@ private protected override void EmitObjectFile(string objectFilePath)
--                if (coffSymbolRecord is CoffSymbol coffSymbol)
++            {
 +                foreach (CoffSymbolRecord symbolRecord in _symbols)
-@@ -557 +921,4 @@ private protected override void EmitObjectFile(string objectFilePath)
--                    stringTable.ReserveString(coffSymbol.Name);
++                {
 +                    if (symbolRecord is CoffSymbol symbol)
 +                    {
 +                        stringTable.ReserveString(symbol.Name);
@@ -1316,7 +1716,7 @@ index d6deb2760..50edfae92 100644
 +                }
 +            }
 +            IlcOptimizationExperiments.RecordPhase("coff-symbol-write", symbolWriteStart);
-@@ -569 +949,19 @@ private protected override void EmitObjectFile(string objectFilePath)
+@@ -569 +949,25 @@ private protected override void EmitObjectFile(string objectFilePath)
 -            stringTable.Write(outputFileStream);
 +            long stringWriteStart = IlcOptimizationExperiments.GetTimestamp();
 +            stringTable.Write(outputStream);
@@ -1337,21 +1737,27 @@ index d6deb2760..50edfae92 100644
 +                IlcOptimizationExperiments.SetCounter("coff-batched-copied-bytes", batchedOutput.CopiedBytes);
 +                IlcOptimizationExperiments.SetCounter("coff-batched-direct-bytes", batchedOutput.DirectBytes);
 +            }
-@@ -722 +1120 @@ private struct CoffHeader
++        }
++
++        private protected override long GetObjectFileOffset(int sectionIndex, long sectionOffset)
++        {
++            uint pointerToRawData = _sections[sectionIndex].Header.PointerToRawData;
++            return pointerToRawData == 0 ? -1 : checked(pointerToRawData + sectionOffset);
+@@ -722 +1126 @@ private struct CoffHeader
 -            public void Write(FileStream stream)
 +            public void Write(Stream stream)
-@@ -787 +1185 @@ private sealed class CoffSectionHeader
+@@ -787 +1191 @@ private sealed class CoffSectionHeader
 -            public void Write(FileStream stream, CoffStringTable stringTable)
 +            public void Write(Stream stream, CoffStringTable stringTable)
-@@ -791 +1189,3 @@ public void Write(FileStream stream, CoffStringTable stringTable)
+@@ -791 +1195,3 @@ public void Write(FileStream stream, CoffStringTable stringTable)
 -                var nameBytes = Encoding.UTF8.GetByteCount(Name);
 +                int nameBytes = s_fastLongNamesEnabled && Name.Length > NameSize ?
 +                    NameSize + 1 :
 +                    Encoding.UTF8.GetByteCount(Name);
-@@ -900 +1300 @@ private sealed class CoffRelocation
+@@ -900 +1306 @@ private sealed class CoffRelocation
 -            public void Write(FileStream stream)
 +            public void Write(Stream stream)
-@@ -911,0 +1312,23 @@ public void Write(FileStream stream)
+@@ -911,0 +1318,23 @@ public void Write(FileStream stream)
 +        private readonly struct CompactCoffRelocation
 +        {
 +            public CompactCoffRelocation(uint virtualAddress, uint symbolTableIndex, CoffRelocationType type)
@@ -1375,12 +1781,12 @@ index d6deb2760..50edfae92 100644
 +            }
 +        }
 +
-@@ -955 +1378,3 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
+@@ -955 +1384,3 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
 -                int nameBytes = Encoding.UTF8.GetByteCount(Name);
 +                int nameBytes = s_fastLongNamesEnabled && Name.Length > NameSize ?
 +                    NameSize + 1 :
 +                    Encoding.UTF8.GetByteCount(Name);
-@@ -1040,0 +1466,216 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
+@@ -1040,0 +1472,216 @@ public override void Write(Stream stream, CoffStringTable stringTable, bool isBi
 +        private struct CompactCoffSymbolRecord
 +        {
 +            private const int NameSize = 8;
@@ -1597,10 +2003,10 @@ index d6deb2760..50edfae92 100644
 +            }
 +        }
 +
-@@ -1050 +1691 @@ private sealed class CoffStringTable : StringTableBuilder
+@@ -1050 +1697 @@ private sealed class CoffStringTable : StringTableBuilder
 -            public new void Write(FileStream stream)
 +            public new void Write(Stream stream)
-@@ -1058,0 +1700,94 @@ private sealed class CoffStringTable : StringTableBuilder
+@@ -1058,0 +1706,94 @@ private sealed class CoffStringTable : StringTableBuilder
 +        private sealed class BufferedOutputStream : Stream
 +        {
 +            private const int BufferSize = 1024 * 1024;
@@ -1695,13 +2101,415 @@ index d6deb2760..50edfae92 100644
 +            public override void SetLength(long value) => throw new NotSupportedException();
 +        }
 +
+diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs
+new file mode 100644
+index 000000000..e62879466
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/IncrementalObjectPatch.cs
+@@ -0,0 +1,396 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++
++using ILCompiler.DependencyAnalysis;
++
++namespace ILCompiler.ObjectWriter
++{
++    public static class IncrementalObjectPatch
++    {
++        private static Dictionary<ObjectNode, Entry> s_entries;
++        private static bool s_recording;
++
++        public static void Begin(IEnumerable<ObjectNode> nodes)
++        {
++            var entries = new Dictionary<ObjectNode, Entry>();
++            foreach (ObjectNode node in nodes)
++            {
++                entries.Add(node, new Entry());
++            }
++
++            s_entries = entries;
++            s_recording = true;
++        }
++
++        public static void Record(
++            ObjectNode node,
++            int sectionIndex,
++            long sectionOffset,
++            ObjectNode.ObjectData data,
++            bool isComdat)
++        {
++            if (!s_recording ||
++                s_entries is null ||
++                !s_entries.TryGetValue(node, out Entry entry))
++            {
++                return;
++            }
++
++            entry.SectionIndex = sectionIndex;
++            entry.SectionOffset = sectionOffset;
++            entry.Data = (byte[])data.Data.Clone();
++            entry.Relocations = data.Relocs;
++            entry.DefinedSymbols = data.DefinedSymbols;
++            entry.Alignment = data.Alignment;
++            entry.IsComdat = isComdat;
++            entry.Recorded = true;
++        }
++
++        public static void Complete(Func<int, long, long> getFileOffset)
++        {
++            if (!s_recording || s_entries is null)
++            {
++                return;
++            }
++
++            foreach (Entry entry in s_entries.Values)
++            {
++                if (entry.Recorded)
++                {
++                    entry.FileOffset = getFileOffset(entry.SectionIndex, entry.SectionOffset);
++                }
++            }
++
++            s_recording = false;
++        }
++
++        public static bool TryPatch(
++            string baseObjectPath,
++            string outputObjectPath,
++            IEnumerable<ObjectNode> changedNodes,
++            NodeFactory factory,
++            out string reason,
++            out long patchedByteCount)
++        {
++            patchedByteCount = 0;
++            if (s_entries is null)
++            {
++                reason = "object-locations-were-not-recorded";
++                return false;
++            }
++
++            var patches = new List<Patch>();
++            var seenNodes = new HashSet<ObjectNode>();
++            if (!TryGetObjectLength(baseObjectPath, out long baseObjectLength, out reason))
++            {
++                return false;
++            }
++            foreach (ObjectNode node in changedNodes)
++            {
++                if (!seenNodes.Add(node))
++                {
++                    reason = "changed-node-was-specified-more-than-once";
++                    return false;
++                }
++                if (!s_entries.TryGetValue(node, out Entry entry) ||
++                    !entry.Recorded ||
++                    entry.FileOffset < 0)
++                {
++                    reason = "changed-node-location-not-recorded";
++                    return false;
++                }
++                if (entry.IsComdat)
++                {
++                    reason = "changed-node-is-comdat";
++                    return false;
++                }
++
++                ObjectNode.ObjectData updatedData = node.GetData(factory);
++                if (entry.FileOffset > baseObjectLength ||
++                    updatedData.Data.Length > baseObjectLength - entry.FileOffset)
++                {
++                    reason = "changed-node-location-out-of-bounds";
++                    return false;
++                }
++                if (updatedData.Data.Length != entry.Data.Length)
++                {
++                    reason = "changed-node-size-changed";
++                    return false;
++                }
++                if (updatedData.Alignment != entry.Alignment)
++                {
++                    reason = "changed-node-alignment-changed";
++                    return false;
++                }
++                if (!DefinedSymbolsMatch(entry.DefinedSymbols, updatedData.DefinedSymbols))
++                {
++                    reason = "changed-node-defined-symbols-changed";
++                    return false;
++                }
++                if (!RelocationsMatch(entry.Relocations, updatedData.Relocs))
++                {
++                    reason = "changed-node-relocations-changed";
++                    return false;
++                }
++
++                bool[] relocationBytes = GetRelocationBytes(updatedData.Data.Length, updatedData.Relocs);
++                for (int i = 0; i < updatedData.Data.Length; i++)
++                {
++                    if (entry.Data[i] == updatedData.Data[i])
++                    {
++                        continue;
++                    }
++                    if (relocationBytes[i])
++                    {
++                        reason = "changed-node-relocation-addend-changed";
++                        return false;
++                    }
++
++                    patches.Add(new Patch(entry.FileOffset + i, entry.Data[i], updatedData.Data[i]));
++                }
++            }
++
++            patches.Sort(static (left, right) => left.Offset.CompareTo(right.Offset));
++            for (int i = 1; i < patches.Count; i++)
++            {
++                if (patches[i - 1].Offset == patches[i].Offset)
++                {
++                    reason = "patch-offset-overlap";
++                    return false;
++                }
++            }
++
++            if (!TryWritePatchedObject(
++                baseObjectPath,
++                outputObjectPath,
++                baseObjectLength,
++                patches,
++                out reason))
++            {
++                return false;
++            }
++
++            patchedByteCount = patches.Count;
++            reason = null;
++            return true;
++        }
++
++        private static bool TryWritePatchedObject(
++            string baseObjectPath,
++            string outputObjectPath,
++            long baseObjectLength,
++            List<Patch> patches,
++            out string reason)
++        {
++            if (File.Exists(outputObjectPath))
++            {
++                reason = "patched-object-output-already-exists";
++                return false;
++            }
++
++            string temporaryPath = outputObjectPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
++            try
++            {
++                using (var baseStream = new FileStream(
++                    baseObjectPath,
++                    FileMode.Open,
++                    FileAccess.Read,
++                    FileShare.Read))
++                {
++                    foreach (Patch patch in patches)
++                    {
++                        baseStream.Position = patch.Offset;
++                        if (baseStream.ReadByte() != patch.ExpectedValue)
++                        {
++                            reason = "base-object-byte-does-not-match-recorded-fragment";
++                            return false;
++                        }
++                    }
++                }
++
++                File.Copy(baseObjectPath, temporaryPath, overwrite: false);
++                using (var stream = new FileStream(
++                    temporaryPath,
++                    FileMode.Open,
++                    FileAccess.Write,
++                    FileShare.None))
++                {
++                    foreach (Patch patch in patches)
++                    {
++                        stream.Position = patch.Offset;
++                        stream.WriteByte(patch.Value);
++                    }
++                    stream.Flush(flushToDisk: true);
++                }
++
++                if (new FileInfo(temporaryPath).Length != baseObjectLength)
++                {
++                    reason = AppendCleanupFailure(
++                        "patched-object-length-changed",
++                        TryDeleteTemporaryFile(temporaryPath));
++                    return false;
++                }
++
++                File.Move(temporaryPath, outputObjectPath);
++            }
++            catch (IOException ex)
++            {
++                reason = AppendCleanupFailure(
++                    $"object-patch-io-failure:{ex.HResult:X8}",
++                    TryDeleteTemporaryFile(temporaryPath));
++                return false;
++            }
++            catch (UnauthorizedAccessException ex)
++            {
++                reason = AppendCleanupFailure(
++                    $"object-patch-access-failure:{ex.HResult:X8}",
++                    TryDeleteTemporaryFile(temporaryPath));
++                return false;
++            }
++
++            reason = null;
++            return true;
++        }
++
++        private static bool TryGetObjectLength(string path, out long length, out string reason)
++        {
++            try
++            {
++                length = new FileInfo(path).Length;
++                reason = null;
++                return true;
++            }
++            catch (IOException ex)
++            {
++                length = 0;
++                reason = $"base-object-io-failure:{ex.HResult:X8}";
++                return false;
++            }
++            catch (UnauthorizedAccessException ex)
++            {
++                length = 0;
++                reason = $"base-object-access-failure:{ex.HResult:X8}";
++                return false;
++            }
++        }
++
++        private static string TryDeleteTemporaryFile(string path)
++        {
++            try
++            {
++                File.Delete(path);
++                return null;
++            }
++            catch (IOException ex)
++            {
++                return $"temporary-object-cleanup-io-failure:{ex.HResult:X8}";
++            }
++            catch (UnauthorizedAccessException ex)
++            {
++                return $"temporary-object-cleanup-access-failure:{ex.HResult:X8}";
++            }
++        }
++
++        private static string AppendCleanupFailure(string reason, string cleanupFailure)
++        {
++            return cleanupFailure is null ? reason : $"{reason};{cleanupFailure}";
++        }
++
++        private static bool DefinedSymbolsMatch(
++            ISymbolDefinitionNode[] left,
++            ISymbolDefinitionNode[] right)
++        {
++            int leftLength = left?.Length ?? 0;
++            int rightLength = right?.Length ?? 0;
++            if (leftLength != rightLength)
++            {
++                return false;
++            }
++
++            for (int i = 0; i < leftLength; i++)
++            {
++                if (!ReferenceEquals(left[i], right[i]) ||
++                    left[i].Offset != right[i].Offset)
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool RelocationsMatch(Relocation[] left, Relocation[] right)
++        {
++            int leftLength = left?.Length ?? 0;
++            int rightLength = right?.Length ?? 0;
++            if (leftLength != rightLength)
++            {
++                return false;
++            }
++
++            for (int i = 0; i < leftLength; i++)
++            {
++                if (left[i].RelocType != right[i].RelocType ||
++                    left[i].Offset != right[i].Offset ||
++                    !ReferenceEquals(left[i].Target, right[i].Target))
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool[] GetRelocationBytes(int dataLength, Relocation[] relocations)
++        {
++            var result = new bool[dataLength];
++            if (relocations is null)
++            {
++                return result;
++            }
++
++            foreach (Relocation relocation in relocations)
++            {
++                // Eight bytes is conservative for all relocations used by the 64-bit prototype.
++                int end = Math.Min(dataLength, relocation.Offset + sizeof(long));
++                for (int i = relocation.Offset; i < end; i++)
++                {
++                    result[i] = true;
++                }
++            }
++
++            return result;
++        }
++
++        private sealed class Entry
++        {
++            public int SectionIndex;
++            public long SectionOffset;
++            public long FileOffset = -1;
++            public byte[] Data;
++            public Relocation[] Relocations;
++            public ISymbolDefinitionNode[] DefinedSymbols;
++            public int Alignment;
++            public bool IsComdat;
++            public bool Recorded;
++        }
++
++        private readonly struct Patch
++        {
++            public Patch(long offset, byte expectedValue, byte value)
++            {
++                Offset = offset;
++                ExpectedValue = expectedValue;
++                Value = value;
++            }
++
++            public long Offset { get; }
++            public byte ExpectedValue { get; }
++            public byte Value { get; }
++        }
++    }
++}
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
-index 6db2bc20b..453a178be 100644
+index 6db2bc20b..dd300c3d0 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/ObjectWriter/ObjectWriter.cs
 @@ -9,0 +10 @@
 +using System.Runtime.InteropServices;
-@@ -20,0 +22,9 @@ public abstract class ObjectWriter
+@@ -20,0 +22,15 @@ public abstract class ObjectWriter
 +        private static readonly bool s_lazyRelocationListsEnabled = IlcOptimizationExperiments.IsEnabled("lazy-relocation-lists");
 +        private static readonly bool s_compactRelocationBlocksEnabled = IlcOptimizationExperiments.IsEnabled("compact-relocation-blocks");
 +        private static readonly bool s_compactSymbolicRelocationsEnabled = IlcOptimizationExperiments.IsEnabled("compact-symbolic-relocations");
@@ -1710,8 +2518,14 @@ index 6db2bc20b..453a178be 100644
 +        private static readonly bool s_mangledNameSingleLookupEnabled = IlcOptimizationExperiments.IsEnabled("mangled-name-single-lookup");
 +        private static readonly bool s_preallocateCollectionsEnabled = IlcOptimizationExperiments.IsEnabled("preallocate-object-writer");
 +        private static readonly bool s_stopAfterObjectNodesEnabled = IlcOptimizationExperiments.IsEnabled("stop-after-object-nodes");
++        private static readonly bool s_preserveRelocatableDataForReemit =
++            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH")) &&
++            !string.Equals(
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                "1",
++                StringComparison.Ordinal);
 +
-@@ -23,0 +34,86 @@ private protected sealed record BlockToRelocate(int SectionIndex, long Offset, b
+@@ -23,0 +40,86 @@ private protected sealed record BlockToRelocate(int SectionIndex, long Offset, b
 +        private protected readonly struct CompactSymbolicRelocation
 +        {
 +            public CompactSymbolicRelocation(long offset, RelocType type, string symbolName, long addend)
@@ -1798,19 +2612,19 @@ index 6db2bc20b..453a178be 100644
 +                }
 +            }
 +        }
-@@ -37,0 +134,4 @@ private protected sealed record BlockToRelocate(int SectionIndex, long Offset, b
+@@ -37,0 +140,4 @@ private protected sealed record BlockToRelocate(int SectionIndex, long Offset, b
 +        private readonly List<List<CompactSymbolicRelocation>> _sectionIndexToCompactRelocations = new();
 +        private readonly List<InlineSymbolicRelocationList> _sectionIndexToInlineRelocations = new();
 +        private int[] _symbolicRelocationCapacityHints;
 +        private long _plannedSymbolicRelocationCapacity;
-@@ -60,0 +161,6 @@ private protected ObjectWriter(NodeFactory factory, ObjectWritingOptions options
+@@ -60,0 +167,6 @@ private protected ObjectWriter(NodeFactory factory, ObjectWritingOptions options
 +        private protected static bool LazyRelocationListsEnabled => s_lazyRelocationListsEnabled;
 +
 +        private protected virtual void PrepareForEmission(int markedNodeCount, int estimatedSectionCount)
 +        {
 +        }
 +
-@@ -90 +196,9 @@ private protected SectionWriter GetOrCreateSection(ObjectNodeSection section, st
+@@ -90 +202,9 @@ private protected SectionWriter GetOrCreateSection(ObjectNodeSection section, st
 -                _sectionIndexToRelocations.Add(new());
 +                _sectionIndexToRelocations.Add(
 +                    s_lazyRelocationListsEnabled || s_compactSymbolicRelocationsEnabled || s_inlineSymbolicRelocationsEnabled ?
@@ -1821,7 +2635,7 @@ index 6db2bc20b..453a178be 100644
 +                        new List<CompactSymbolicRelocation>() :
 +                        null);
 +                _sectionIndexToInlineRelocations.Add(null);
-@@ -207 +321,37 @@ protected internal virtual void EmitRelocation(
+@@ -207 +327,37 @@ protected internal virtual void EmitRelocation(
 -            _sectionIndexToRelocations[sectionIndex].Add(new SymbolicRelocation(offset, relocType, symbolName, addend));
 +            if (s_inlineSymbolicRelocationsEnabled)
 +            {
@@ -1860,7 +2674,7 @@ index 6db2bc20b..453a178be 100644
 +                _sectionIndexToRelocations[sectionIndex] = relocations;
 +            }
 +            relocations.Add(new SymbolicRelocation(offset, relocType, symbolName, addend));
-@@ -212 +362,7 @@ private protected bool SectionHasRelocations(int sectionIndex)
+@@ -212 +368,7 @@ private protected bool SectionHasRelocations(int sectionIndex)
 -            return _sectionIndexToRelocations[sectionIndex].Count > 0;
 +            if (s_inlineSymbolicRelocationsEnabled)
 +            {
@@ -1869,7 +2683,7 @@ index 6db2bc20b..453a178be 100644
 +            return s_compactSymbolicRelocationsEnabled ?
 +                _sectionIndexToCompactRelocations[sectionIndex]?.Count > 0 :
 +                _sectionIndexToRelocations[sectionIndex]?.Count > 0;
-@@ -225,0 +382,14 @@ private protected virtual void EmitReferencedMethod(string symbolName) { }
+@@ -225,0 +388,14 @@ private protected virtual void EmitReferencedMethod(string symbolName) { }
 +        private protected virtual void EmitCompactRelocations(
 +            int sectionIndex,
 +            List<CompactSymbolicRelocation> relocationList)
@@ -1884,7 +2698,7 @@ index 6db2bc20b..453a178be 100644
 +            throw new PlatformNotSupportedException();
 +        }
 +
-@@ -257,0 +428,14 @@ private protected string GetMangledName(ISymbolNode symbolNode)
+@@ -257,0 +434,14 @@ private protected string GetMangledName(ISymbolNode symbolNode)
 +            if (s_mangledNameSingleLookupEnabled)
 +            {
 +                ref string cachedName = ref CollectionsMarshal.GetValueRefOrAddDefault(
@@ -1899,7 +2713,13 @@ index 6db2bc20b..453a178be 100644
 +                return cachedName;
 +            }
 +
-@@ -309,0 +494,42 @@ private SortedSet<string> GetUndefinedSymbols()
+@@ -304,0 +495,5 @@ private protected virtual void EmitSectionsAndLayout()
++        private protected virtual long GetObjectFileOffset(int sectionIndex, long sectionOffset)
++        {
++            return -1;
++        }
++
+@@ -309,0 +505,42 @@ private SortedSet<string> GetUndefinedSymbols()
 +            if (s_inlineSymbolicRelocationsEnabled)
 +            {
 +                foreach (InlineSymbolicRelocationList relocationList in _sectionIndexToInlineRelocations)
@@ -1942,16 +2762,16 @@ index 6db2bc20b..453a178be 100644
 +                return undefinedSymbolSet;
 +            }
 +
-@@ -310,0 +537,6 @@ private SortedSet<string> GetUndefinedSymbols()
+@@ -310,0 +548,6 @@ private SortedSet<string> GetUndefinedSymbols()
 +            {
 +            if (relocationList is null)
 +            {
 +                continue;
 +            }
 +
-@@ -317,0 +550 @@ private SortedSet<string> GetUndefinedSymbols()
+@@ -317,0 +561 @@ private SortedSet<string> GetUndefinedSymbols()
 +            }
-@@ -340,0 +574,9 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -340,0 +585,9 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            if (s_preallocateCollectionsEnabled)
 +            {
 +                int estimatedSectionCount = Math.Max(16, nodes.Count / 8);
@@ -1961,22 +2781,44 @@ index 6db2bc20b..453a178be 100644
 +                IlcOptimizationExperiments.SetCounter("object-preallocated-section-capacity", estimatedSectionCount);
 +            }
 +
-@@ -374 +616,5 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -374 +627,5 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -            List<BlockToRelocate> blocksToRelocate = new();
 +            List<BlockToRelocate> blocksToRelocate =
 +                s_compactRelocationBlocksEnabled ? null : new List<BlockToRelocate>();
 +            ChunkedValueList<CompactBlockToRelocate> compactBlocksToRelocate =
 +                s_compactRelocationBlocksEnabled ? new ChunkedValueList<CompactBlockToRelocate>() : null;
 +            long materializationStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -378,0 +625,5 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -378,0 +636,5 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +                {
 +                    if (s_stopAfterObjectNodesEnabled)
 +                    {
 +                        break;
 +                    }
-@@ -379,0 +631 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -379,0 +642 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +                }
-@@ -439,5 +691,16 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -395,0 +659,10 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++                if (s_preserveRelocatableDataForReemit &&
++                    nodeContents.Relocs is not null &&
++                    nodeContents.Relocs.Length != 0)
++                {
++                    nodeContents = new ObjectData(
++                        (byte[])nodeContents.Data.Clone(),
++                        nodeContents.Relocs,
++                        nodeContents.Alignment,
++                        nodeContents.DefinedSymbols);
++                }
+@@ -406 +679,2 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-                SectionWriter sectionWriter = ShouldShareSymbol(node, section) ?
++                bool isComdat = ShouldShareSymbol(node, section);
++                SectionWriter sectionWriter = isComdat ?
+@@ -410,0 +685,6 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++                IncrementalObjectPatch.Record(
++                    node,
++                    sectionWriter.SectionIndex,
++                    sectionWriter.Position,
++                    nodeContents,
++                    isComdat);
+@@ -439,5 +719,16 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                    blocksToRelocate.Add(new BlockToRelocate(
 -                        sectionWriter.SectionIndex,
 -                        sectionWriter.Position,
@@ -1998,18 +2840,15 @@ index 6db2bc20b..453a178be 100644
 +                            nodeContents.Data,
 +                            nodeContents.Relocs));
 +                    }
-@@ -475,0 +739 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -475,0 +767,31 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            IlcOptimizationExperiments.RecordPhase("object-node-materialization", materializationStart);
-@@ -477 +741,2 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
--            foreach (BlockToRelocate blockToRelocate in blocksToRelocate)
++
 +            long relocationCapacityStart = IlcOptimizationExperiments.GetTimestamp();
 +            if (s_exactSymbolicRelocationCapacityEnabled)
-@@ -479 +744,2 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
--                foreach (Relocation reloc in blockToRelocate.Relocations)
++            {
 +                _symbolicRelocationCapacityHints = new int[_sectionIndexToData.Count];
 +                if (s_compactRelocationBlocksEnabled)
-@@ -481 +747,32 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
--                    ISymbolNode relocTarget = _nodeFactory.ObjectInterner.GetDeduplicatedSymbol(_nodeFactory, reloc.Target);
++                {
 +                    foreach (ref readonly CompactBlockToRelocate blockToRelocate in compactBlocksToRelocate)
 +                    {
 +                        _plannedSymbolicRelocationCapacity += blockToRelocate.Relocations.Length;
@@ -2033,19 +2872,22 @@ index 6db2bc20b..453a178be 100644
 +                    _plannedSymbolicRelocationCapacity);
 +            }
 +            IlcOptimizationExperiments.RecordPhase("object-relocation-capacity-planning", relocationCapacityStart);
-+
+@@ -477 +799,2 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-            foreach (BlockToRelocate blockToRelocate in blocksToRelocate)
 +            long relocationResolutionStart = IlcOptimizationExperiments.GetTimestamp();
 +            if (s_compactRelocationBlocksEnabled)
-+            {
+@@ -479 +802 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-                foreach (Relocation reloc in blockToRelocate.Relocations)
 +                foreach (ref readonly CompactBlockToRelocate blockToRelocate in compactBlocksToRelocate)
-+                {
+@@ -481 +804,3 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+-                    ISymbolNode relocTarget = _nodeFactory.ObjectInterner.GetDeduplicatedSymbol(_nodeFactory, reloc.Target);
 +                    foreach (Relocation reloc in blockToRelocate.Relocations)
 +                    {
 +                        ISymbolNode relocTarget = _nodeFactory.ObjectInterner.GetDeduplicatedSymbol(_nodeFactory, reloc.Target);
-@@ -483 +780 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -483 +808 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                    string relocSymbolName = GetMangledName(relocTarget);
 +                        string relocSymbolName = GetMangledName(relocTarget);
-@@ -485,7 +782,7 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -485,7 +810,7 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                    EmitOrResolveRelocation(
 -                        blockToRelocate.SectionIndex,
 -                        blockToRelocate.Offset + reloc.Offset,
@@ -2060,7 +2902,7 @@ index 6db2bc20b..453a178be 100644
 +                            reloc.RelocType,
 +                            relocSymbolName,
 +                            relocTarget.Offset);
-@@ -493,2 +790,13 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -493,2 +818,13 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                    if (_options.HasFlag(ObjectWritingOptions.ControlFlowGuard) &&
 -                        relocTarget is IMethodNode or AssemblyStubNode or AddressTakenExternFunctionSymbolNode)
 +                        if (_options.HasFlag(ObjectWritingOptions.ControlFlowGuard) &&
@@ -2076,7 +2918,7 @@ index 6db2bc20b..453a178be 100644
 +                foreach (BlockToRelocate blockToRelocate in blocksToRelocate)
 +                {
 +                    foreach (Relocation reloc in blockToRelocate.Relocations)
-@@ -496,4 +804,20 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -496,4 +832,20 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                        // For now consider all method symbols address taken.
 -                        // We could restrict this in the future to those that are referenced from
 -                        // reflection tables, EH tables, were actually address taken in code, or are referenced from vtables.
@@ -2101,7 +2943,7 @@ index 6db2bc20b..453a178be 100644
 +                            // reflection tables, EH tables, were actually address taken in code, or are referenced from vtables.
 +                            EmitReferencedMethod(relocSymbolName);
 +                        }
-@@ -503 +827,11 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -503 +855,11 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -            blocksToRelocate.Clear();
 +            int blocksWithRelocations = s_compactRelocationBlocksEnabled ?
 +                compactBlocksToRelocate.Count :
@@ -2114,11 +2956,11 @@ index 6db2bc20b..453a178be 100644
 +                _symbolicRelocationCapacityHints = null;
 +            }
 +            IlcOptimizationExperiments.RecordPhase("object-relocation-resolution", relocationResolutionStart);
-@@ -504,0 +839 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -504,0 +867 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            long sectionLayoutStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -505,0 +841 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -505,0 +869 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            IlcOptimizationExperiments.RecordPhase("object-section-layout", sectionLayoutStart);
-@@ -515 +851,9 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -515 +879,9 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                    if (node is null || node.ShouldSkipEmittingObjectNode(_nodeFactory))
 +                    if (node is null)
 +                    {
@@ -2129,7 +2971,7 @@ index 6db2bc20b..453a178be 100644
 +                        continue;
 +                    }
 +                    if (node.ShouldSkipEmittingObjectNode(_nodeFactory))
-@@ -561 +905,7 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -561 +933,7 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -            EmitSymbolTable(_definedSymbols, GetUndefinedSymbols());
 +            long undefinedSymbolsStart = IlcOptimizationExperiments.GetTimestamp();
 +            SortedSet<string> undefinedSymbols = GetUndefinedSymbols();
@@ -2138,12 +2980,12 @@ index 6db2bc20b..453a178be 100644
 +            long symbolTableStart = IlcOptimizationExperiments.GetTimestamp();
 +            EmitSymbolTable(_definedSymbols, undefinedSymbols);
 +            IlcOptimizationExperiments.RecordPhase("object-symbol-table", symbolTableStart);
-@@ -562,0 +913 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -562,0 +941 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            long relocationConversionStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -564 +915 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -564 +943 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -            foreach (List<SymbolicRelocation> relocationList in _sectionIndexToRelocations)
 +            if (s_inlineSymbolicRelocationsEnabled)
-@@ -566,2 +917,8 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -566,2 +945,8 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 -                EmitRelocations(relocSectionIndex, relocationList);
 -                relocSectionIndex++;
 +                foreach (InlineSymbolicRelocationList relocationList in _sectionIndexToInlineRelocations)
@@ -2154,7 +2996,7 @@ index 6db2bc20b..453a178be 100644
 +                    }
 +                    relocSectionIndex++;
 +                }
-@@ -568,0 +926,23 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -568,0 +954,23 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            else if (s_compactSymbolicRelocationsEnabled)
 +            {
 +                foreach (List<CompactSymbolicRelocation> relocationList in _sectionIndexToCompactRelocations)
@@ -2178,9 +3020,10 @@ index 6db2bc20b..453a178be 100644
 +                }
 +            }
 +            IlcOptimizationExperiments.RecordPhase("object-relocation-conversion", relocationConversionStart);
-@@ -569,0 +950 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -569,0 +978 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
 +            long fileWriteStart = IlcOptimizationExperiments.GetTimestamp();
-@@ -570,0 +952,37 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
+@@ -570,0 +980,38 @@ private void EmitObject(string objectFilePath, IReadOnlyCollection<DependencyNod
++            IncrementalObjectPatch.Complete(GetObjectFileOffset);
 +            IlcOptimizationExperiments.RecordPhase("object-file-write", fileWriteStart);
 +            IlcOptimizationExperiments.SetCounter("object-blocks-with-relocations", blocksWithRelocations);
 +            if (s_compactRelocationBlocksEnabled)
@@ -2218,7 +3061,7 @@ index 6db2bc20b..453a178be 100644
 +            IlcOptimizationExperiments.SetCounter("object-mangled-name-count", _mangledNameMap.Count);
 +            IlcOptimizationExperiments.SetCounter("object-section-count", _sectionIndexToData.Count);
 +            IlcOptimizationExperiments.SetCounter("object-undefined-symbol-count", undefinedSymbols.Count);
-@@ -587,0 +1006,65 @@ public static void EmitObject(string objectFilePath, IReadOnlyCollection<Depende
+@@ -587,0 +1035,65 @@ public static void EmitObject(string objectFilePath, IReadOnlyCollection<Depende
 +        private sealed class ChunkedValueList<T>
 +        {
 +            private const int ChunkShift = 16;
@@ -2459,11 +3302,13 @@ index 81f7315d2..5c657f44d 100644
 -            if (_reservedStrings.Count > 0)
 +            if (s_hashSetReserveEnabled ? _reservedStringsHash.Count > 0 : _reservedStrings.Count > 0)
 diff --git a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
-index 862404c49..814e4340e 100644
+index 862404c49..07bfa3b17 100644
 --- a/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
 +++ b/src/coreclr/tools/aot/ILCompiler.Compiler/ILCompiler.Compiler.csproj
 @@ -494,0 +495 @@
 +    <Compile Include="Compiler\CompilerProfile.cs" />
+@@ -622,0 +624 @@
++    <Compile Include="Compiler\ObjectWriter\IncrementalObjectPatch.cs" />
 diff --git a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs b/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
 index e7f7503bb..77fe7df4d 100644
 --- a/src/coreclr/tools/aot/ILCompiler.DependencyAnalysisFramework/DependencyAnalyzer.cs
@@ -3178,56 +4023,1270 @@ index 000000000..b8fc18459
 +        bool ShouldSort(T value);
 +    }
 +}
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/DependencyAnalysis/MethodCodeNode.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/DependencyAnalysis/MethodCodeNode.cs
+index 044187005..ecb0765e7 100644
+--- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/DependencyAnalysis/MethodCodeNode.cs
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/DependencyAnalysis/MethodCodeNode.cs
+@@ -45,0 +46,14 @@ public void SetCode(ObjectData data)
++        internal void ResetForIncrementalCompilation()
++        {
++            _methodCode = null;
++            _frameInfos = null;
++            _gcInfo = null;
++            _ehInfo = null;
++            _debugLocInfos = null;
++            _debugVarInfos = null;
++            _debugEHClauseInfos = null;
++            _nonRelocationDependencies = null;
++            _debugInfo = null;
++            _localTypes = null;
++        }
++
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalBodyUpdate.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalBodyUpdate.cs
+new file mode 100644
+index 000000000..e80c04315
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalBodyUpdate.cs
+@@ -0,0 +1,592 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Reflection.Metadata;
++using System.Reflection.Metadata.Ecma335;
++using System.Reflection.PortableExecutable;
++
++using ILCompiler.DependencyAnalysis;
++using ILCompiler.DependencyAnalysisFramework;
++
++using Internal.IL;
++using Internal.TypeSystem;
++using Internal.TypeSystem.Ecma;
++
++namespace ILCompiler
++{
++    internal sealed class IncrementalBodyUpdate : ILProvider
++    {
++        private static readonly bool s_allowUnsafeBodyShapesForTesting =
++            string.Equals(
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_ALLOW_UNSAFE_BODY_SHAPES"),
++                "1",
++                StringComparison.Ordinal);
++
++        private readonly ILProvider _baseProvider;
++        private readonly Guid _baseMvid;
++        private readonly Dictionary<int, byte[]> _updatedMethodBodies;
++
++        private IncrementalBodyUpdate(
++            ILProvider baseProvider,
++            Guid baseMvid,
++            Dictionary<int, byte[]> updatedMethodBodies)
++        {
++            _baseProvider = baseProvider;
++            _baseMvid = baseMvid;
++            _updatedMethodBodies = updatedMethodBodies;
++        }
++
++        public int ChangedMethodCount => _updatedMethodBodies.Count;
++
++        public static void WriteCandidates(
++            ILProvider ilProvider,
++            string assemblyPath,
++            IEnumerable<DependencyNodeCore<NodeFactory>> nodes,
++            NodeFactory factory,
++            string outputPath)
++        {
++            byte[] image = File.ReadAllBytes(assemblyPath);
++            using var reader = new PEReader(new MemoryStream(image, writable: false));
++            MetadataReader metadata = reader.GetMetadataReader();
++            Guid targetMvid = metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
++            var seenMethods = new HashSet<int>();
++            var lines = new List<string>
++            {
++                "token|ilOffset|opcode|strictLeaf|method",
++            };
++
++            foreach (DependencyNodeCore<NodeFactory> node in nodes)
++            {
++                if (node is not MethodCodeNode methodCodeNode ||
++                    methodCodeNode.Method.GetTypicalMethodDefinition() is not EcmaMethod ecmaMethod)
++                {
++                    continue;
++                }
++
++                MetadataReader methodMetadata = ecmaMethod.Module.MetadataReader;
++                if (methodMetadata.GetGuid(methodMetadata.GetModuleDefinition().Mvid) != targetMvid)
++                {
++                    continue;
++                }
++
++                int token = MetadataTokens.GetToken(ecmaMethod.Handle);
++                if (!seenMethods.Add(token) ||
++                    (ecmaMethod.Name is ".cctor" or ".ctor") ||
++                    methodCodeNode.Method.HasInstantiation ||
++                    methodCodeNode.Method.OwningType.HasInstantiation ||
++                    methodCodeNode.IsSpecialUnboxingThunk ||
++                    methodCodeNode.HasConditionalStaticDependencies ||
++                    methodCodeNode.EHInfo is not null ||
++                    factory.CanFoldMethodBodyForIncrementalCompilation(methodCodeNode.Method))
++                {
++                    continue;
++                }
++
++                MethodIL methodIl = ilProvider.GetMethodIL(methodCodeNode.Method)?.GetMethodILDefinition();
++                if (methodIl is not EcmaMethodIL)
++                {
++                    continue;
++                }
++
++                byte[] ilBytes = methodIl.GetILBytes();
++                bool strictLeaf = HasOnlyAllowedLeafOpcodes(ilBytes);
++                var ilReader = new ILReader(ilBytes);
++                while (ilReader.HasNext)
++                {
++                    ILOpcode opcode = ilReader.ReadILOpcode();
++                    int operandOffset = ilReader.Offset;
++                    ilReader.Skip(opcode);
++                    if (opcode is
++                        ILOpcode.ldc_i4_s or
++                        ILOpcode.ldc_i4 or
++                        ILOpcode.ldc_i8 or
++                        ILOpcode.ldc_r4 or
++                        ILOpcode.ldc_r8)
++                    {
++                        lines.Add($"{token:X8}|{operandOffset}|{opcode}|{strictLeaf}|{methodCodeNode.Method}");
++                    }
++                }
++            }
++
++            File.WriteAllLines(outputPath, lines);
++        }
++
++        public static bool TryCreate(
++            ILProvider baseProvider,
++            string baseAssemblyPath,
++            string updatedAssemblyPath,
++            bool allowUnchangedTarget,
++            out IncrementalBodyUpdate update,
++            out string reason)
++        {
++            update = null;
++
++            if (string.IsNullOrEmpty(baseAssemblyPath) || string.IsNullOrEmpty(updatedAssemblyPath))
++            {
++                reason = "base-or-updated-assembly-path-missing";
++                return false;
++            }
++
++            byte[] baseImage = File.ReadAllBytes(baseAssemblyPath);
++            byte[] updatedImage = File.ReadAllBytes(updatedAssemblyPath);
++            if (baseImage.Length != updatedImage.Length)
++            {
++                reason = "assembly-size-changed";
++                return false;
++            }
++
++            using var baseReader = new PEReader(new MemoryStream(baseImage, writable: false));
++            using var updatedReader = new PEReader(new MemoryStream(updatedImage, writable: false));
++            if (!baseReader.HasMetadata || !updatedReader.HasMetadata)
++            {
++                reason = "assembly-has-no-metadata";
++                return false;
++            }
++
++            MetadataReader baseMetadata = baseReader.GetMetadataReader();
++            MetadataReader updatedMetadata = updatedReader.GetMetadataReader();
++            if (baseMetadata.MethodDefinitions.Count != updatedMetadata.MethodDefinitions.Count)
++            {
++                reason = "method-definition-count-changed";
++                return false;
++            }
++
++            Guid baseMvid = baseMetadata.GetGuid(baseMetadata.GetModuleDefinition().Mvid);
++            Guid updatedMvid = updatedMetadata.GetGuid(updatedMetadata.GetModuleDefinition().Mvid);
++            if (baseMvid != updatedMvid)
++            {
++                reason = "module-version-id-changed";
++                return false;
++            }
++
++            byte[] sanitizedBaseImage = (byte[])baseImage.Clone();
++            byte[] sanitizedUpdatedImage = (byte[])updatedImage.Clone();
++
++            if (!TryMaskNonSemanticDirectories(baseReader, sanitizedBaseImage, out reason) ||
++                !TryMaskNonSemanticDirectories(updatedReader, sanitizedUpdatedImage, out reason))
++            {
++                return false;
++            }
++
++            var updatedBodies = new Dictionary<int, byte[]>();
++            foreach (MethodDefinitionHandle methodHandle in baseMetadata.MethodDefinitions)
++            {
++                MethodDefinition baseMethod = baseMetadata.GetMethodDefinition(methodHandle);
++                MethodDefinition updatedMethod = updatedMetadata.GetMethodDefinition(methodHandle);
++                int baseRva = baseMethod.RelativeVirtualAddress;
++                int updatedRva = updatedMethod.RelativeVirtualAddress;
++
++                if ((baseRva == 0) != (updatedRva == 0))
++                {
++                    reason = $"method-body-presence-changed:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++                if (baseRva == 0)
++                {
++                    continue;
++                }
++
++                MethodBodyBlock baseBody = baseReader.GetMethodBody(baseRva);
++                MethodBodyBlock updatedBody = updatedReader.GetMethodBody(updatedRva);
++                if (baseBody.Size != updatedBody.Size)
++                {
++                    reason = $"method-body-size-changed:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++
++                if (!TryMaskMethodBody(baseReader.PEHeaders, sanitizedBaseImage, baseRva, baseBody.Size) ||
++                    !TryMaskMethodBody(updatedReader.PEHeaders, sanitizedUpdatedImage, updatedRva, updatedBody.Size))
++                {
++                    reason = $"method-body-location-invalid:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++
++                byte[] baseIl = baseBody.GetILBytes();
++                byte[] updatedIl = updatedBody.GetILBytes();
++                if (!HasEquivalentMethodBodyShape(baseBody, updatedBody))
++                {
++                    reason = $"method-body-shape-changed:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++                if (baseIl.AsSpan().SequenceEqual(updatedIl))
++                {
++                    continue;
++                }
++
++                string methodName = baseMetadata.GetString(baseMethod.Name);
++                if (methodName is ".cctor" or ".ctor")
++                {
++                    reason = $"constructor-body-changed:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++
++                TypeDefinition declaringType = baseMetadata.GetTypeDefinition(baseMethod.GetDeclaringType());
++                if (baseMethod.GetGenericParameters().Count != 0 ||
++                    declaringType.GetGenericParameters().Count != 0)
++                {
++                    reason = $"generic-method-or-type-changed:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++
++                if (!s_allowUnsafeBodyShapesForTesting &&
++                    !IsDependencyNeutralConstantChange(baseIl, updatedIl))
++                {
++                    reason = $"changed-body-is-not-constant-only:{MetadataTokens.GetToken(methodHandle):X8}";
++                    return false;
++                }
++
++                updatedBodies.Add(MetadataTokens.GetToken(methodHandle), updatedIl);
++            }
++
++            if (!sanitizedBaseImage.AsSpan().SequenceEqual(sanitizedUpdatedImage))
++            {
++                reason = "non-method-assembly-content-changed";
++                return false;
++            }
++            if (updatedBodies.Count == 0 && !allowUnchangedTarget)
++            {
++                reason = "no-method-body-changes";
++                return false;
++            }
++
++            update = new IncrementalBodyUpdate(baseProvider, baseMvid, updatedBodies);
++            reason = null;
++            return true;
++        }
++
++        public bool IsChangedMethod(MethodDesc method)
++        {
++            return TryGetTargetMethod(method, out EcmaMethod ecmaMethod, out int token) &&
++                _updatedMethodBodies.ContainsKey(token) &&
++                ecmaMethod.Name is not ".cctor" and not ".ctor";
++        }
++
++        public bool IsAffectedMethod(MethodDesc method, IncrementalBodyUpdate previousUpdate)
++        {
++            return IsChangedMethod(method) ||
++                (previousUpdate is not null && previousUpdate.IsChangedMethod(method));
++        }
++
++        public int GetAffectedMethodCount(IncrementalBodyUpdate previousUpdate)
++        {
++            int result = _updatedMethodBodies.Count;
++            if (previousUpdate is not null)
++            {
++                foreach (int token in previousUpdate._updatedMethodBodies.Keys)
++                {
++                    if (!_updatedMethodBodies.ContainsKey(token))
++                    {
++                        result++;
++                    }
++                }
++            }
++
++            return result;
++        }
++
++        public bool CanOverlayChangedMethod(MethodDesc method, out string reason)
++        {
++            if (!IsChangedMethod(method))
++            {
++                reason = null;
++                return true;
++            }
++
++            MethodIL original = _baseProvider.GetMethodIL(method);
++            if (original is null)
++            {
++                reason = "changed-method-has-no-il";
++                return false;
++            }
++
++            if (original.GetMethodILDefinition() is not (EcmaMethodIL or UpdatedMethodIL))
++            {
++                reason = "changed-method-il-is-not-overlayable";
++                return false;
++            }
++
++            reason = null;
++            return true;
++        }
++
++        public override MethodIL GetMethodIL(MethodDesc method)
++        {
++            MethodIL original = _baseProvider.GetMethodIL(method);
++            if (original is null ||
++                !TryGetTargetMethod(method, out EcmaMethod ecmaMethod, out int token) ||
++                !_updatedMethodBodies.TryGetValue(token, out byte[] updatedIl))
++            {
++                return original;
++            }
++
++            MethodIL originalDefinition = original.GetMethodILDefinition();
++            if (originalDefinition is not (EcmaMethodIL or UpdatedMethodIL))
++            {
++                throw new InvalidOperationException(
++                    $"Incremental IL cannot overlay method token {token:X8}.");
++            }
++
++            var updatedDefinition = new UpdatedMethodIL(ecmaMethod, originalDefinition, updatedIl);
++            return method == ecmaMethod ?
++                updatedDefinition :
++                new InstantiatedMethodIL(method, updatedDefinition);
++        }
++
++        private bool TryGetTargetMethod(MethodDesc method, out EcmaMethod ecmaMethod, out int token)
++        {
++            ecmaMethod = method.GetTypicalMethodDefinition() as EcmaMethod;
++            if (ecmaMethod is null)
++            {
++                token = 0;
++                return false;
++            }
++
++            MetadataReader metadata = ecmaMethod.Module.MetadataReader;
++            Guid mvid = metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
++            if (mvid != _baseMvid)
++            {
++                token = 0;
++                return false;
++            }
++
++            token = MetadataTokens.GetToken(ecmaMethod.Handle);
++            return true;
++        }
++
++        private static bool HasEquivalentMethodBodyShape(MethodBodyBlock left, MethodBodyBlock right)
++        {
++            if (left.MaxStack != right.MaxStack ||
++                left.LocalVariablesInitialized != right.LocalVariablesInitialized ||
++                left.LocalSignature != right.LocalSignature ||
++                left.ExceptionRegions.Length != right.ExceptionRegions.Length)
++            {
++                return false;
++            }
++
++            for (int i = 0; i < left.ExceptionRegions.Length; i++)
++            {
++                ExceptionRegion leftRegion = left.ExceptionRegions[i];
++                ExceptionRegion rightRegion = right.ExceptionRegions[i];
++                if (leftRegion.Kind != rightRegion.Kind ||
++                    leftRegion.TryOffset != rightRegion.TryOffset ||
++                    leftRegion.TryLength != rightRegion.TryLength ||
++                    leftRegion.HandlerOffset != rightRegion.HandlerOffset ||
++                    leftRegion.HandlerLength != rightRegion.HandlerLength ||
++                    leftRegion.CatchType != rightRegion.CatchType ||
++                    leftRegion.FilterOffset != rightRegion.FilterOffset)
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool IsDependencyNeutralConstantChange(ReadOnlySpan<byte> baseIl, ReadOnlySpan<byte> updatedIl)
++        {
++            var baseReader = new ILReader(baseIl);
++            var updatedReader = new ILReader(updatedIl);
++            bool foundChangedConstant = false;
++
++            while (baseReader.HasNext && updatedReader.HasNext)
++            {
++                ILOpcode baseOpcode = baseReader.ReadILOpcode();
++                ILOpcode updatedOpcode = updatedReader.ReadILOpcode();
++                if (baseOpcode != updatedOpcode || !IsAllowedLeafOpcode(baseOpcode))
++                {
++                    return false;
++                }
++
++                int baseOperandStart = baseReader.Offset;
++                int updatedOperandStart = updatedReader.Offset;
++                baseReader.Skip(baseOpcode);
++                updatedReader.Skip(updatedOpcode);
++
++                ReadOnlySpan<byte> baseOperand = baseIl.Slice(baseOperandStart, baseReader.Offset - baseOperandStart);
++                ReadOnlySpan<byte> updatedOperand = updatedIl.Slice(updatedOperandStart, updatedReader.Offset - updatedOperandStart);
++                if (!baseOperand.SequenceEqual(updatedOperand))
++                {
++                    if (baseOpcode is not (
++                        ILOpcode.ldc_i4_s or
++                        ILOpcode.ldc_i4 or
++                        ILOpcode.ldc_i8 or
++                        ILOpcode.ldc_r4 or
++                        ILOpcode.ldc_r8))
++                    {
++                        return false;
++                    }
++                    foundChangedConstant = true;
++                }
++            }
++
++            return foundChangedConstant &&
++                !baseReader.HasNext &&
++                !updatedReader.HasNext;
++        }
++
++        private static bool HasOnlyAllowedLeafOpcodes(ReadOnlySpan<byte> il)
++        {
++            var reader = new ILReader(il);
++            while (reader.HasNext)
++            {
++                ILOpcode opcode = reader.ReadILOpcode();
++                if (!IsAllowedLeafOpcode(opcode))
++                {
++                    return false;
++                }
++                reader.Skip(opcode);
++            }
++
++            return true;
++        }
++
++        private static bool IsAllowedLeafOpcode(ILOpcode opcode)
++        {
++            return opcode is
++                ILOpcode.nop or
++                ILOpcode.ldarg_0 or
++                ILOpcode.ldarg_1 or
++                ILOpcode.ldarg_2 or
++                ILOpcode.ldarg_3 or
++                ILOpcode.ldarg_s or
++                ILOpcode.ldarg or
++                ILOpcode.ldc_i4_m1 or
++                ILOpcode.ldc_i4_0 or
++                ILOpcode.ldc_i4_1 or
++                ILOpcode.ldc_i4_2 or
++                ILOpcode.ldc_i4_3 or
++                ILOpcode.ldc_i4_4 or
++                ILOpcode.ldc_i4_5 or
++                ILOpcode.ldc_i4_6 or
++                ILOpcode.ldc_i4_7 or
++                ILOpcode.ldc_i4_8 or
++                ILOpcode.ldc_i4_s or
++                ILOpcode.ldc_i4 or
++                ILOpcode.ldc_i8 or
++                ILOpcode.ldc_r4 or
++                ILOpcode.ldc_r8 or
++                ILOpcode.add or
++                ILOpcode.sub or
++                ILOpcode.mul or
++                ILOpcode.div or
++                ILOpcode.div_un or
++                ILOpcode.rem or
++                ILOpcode.rem_un or
++                ILOpcode.and or
++                ILOpcode.or or
++                ILOpcode.xor or
++                ILOpcode.shl or
++                ILOpcode.shr or
++                ILOpcode.shr_un or
++                ILOpcode.neg or
++                ILOpcode.not or
++                ILOpcode.conv_i4 or
++                ILOpcode.conv_i8 or
++                ILOpcode.conv_u4 or
++                ILOpcode.conv_u8 or
++                ILOpcode.ret;
++        }
++
++        private static bool TryMaskNonSemanticDirectories(PEReader reader, byte[] image, out string reason)
++        {
++            PEHeaders headers = reader.PEHeaders;
++            image.AsSpan(headers.CoffHeaderStartOffset + sizeof(uint), sizeof(uint)).Clear();
++            if (headers.PEHeader is not null)
++            {
++                const int ChecksumOffsetInPEHeader = 64;
++                image.AsSpan(
++                    headers.PEHeaderStartOffset + ChecksumOffsetInPEHeader,
++                    sizeof(uint)).Clear();
++            }
++
++            if (headers.CorHeader is not null &&
++                !TryMaskDirectory(headers, image, headers.CorHeader.StrongNameSignatureDirectory))
++            {
++                reason = "strong-name-directory-location-invalid";
++                return false;
++            }
++            if (headers.PEHeader is not null &&
++                !TryMaskDirectory(headers, image, headers.PEHeader.DebugTableDirectory))
++            {
++                reason = "debug-directory-location-invalid";
++                return false;
++            }
++
++            reason = null;
++            return true;
++        }
++
++        private static bool TryMaskDirectory(PEHeaders headers, byte[] image, DirectoryEntry directory)
++        {
++            if (directory.Size == 0)
++            {
++                return true;
++            }
++
++            int offset = RvaToFileOffset(headers, directory.RelativeVirtualAddress);
++            if (offset < 0 || offset > image.Length - directory.Size)
++            {
++                return false;
++            }
++            image.AsSpan(offset, directory.Size).Clear();
++            return true;
++        }
++
++        private static bool TryMaskMethodBody(
++            PEHeaders headers,
++            byte[] image,
++            int relativeVirtualAddress,
++            int size)
++        {
++            int offset = RvaToFileOffset(headers, relativeVirtualAddress);
++            if (offset < 0 || offset > image.Length - size)
++            {
++                return false;
++            }
++            image.AsSpan(offset, size).Clear();
++            return true;
++        }
++
++        private static int RvaToFileOffset(PEHeaders headers, int relativeVirtualAddress)
++        {
++            foreach (SectionHeader section in headers.SectionHeaders)
++            {
++                int sectionSize = Math.Max(section.VirtualSize, section.SizeOfRawData);
++                int offsetInSection = relativeVirtualAddress - section.VirtualAddress;
++                if ((uint)offsetInSection < (uint)sectionSize)
++                {
++                    return checked(section.PointerToRawData + offsetInSection);
++                }
++            }
++
++            return -1;
++        }
++
++        private sealed class UpdatedMethodIL : MethodIL
++        {
++            private readonly EcmaMethod _method;
++            private readonly MethodIL _original;
++            private readonly byte[] _updatedIl;
++
++            public UpdatedMethodIL(EcmaMethod method, MethodIL original, byte[] updatedIl)
++            {
++                _method = method;
++                _original = original;
++                _updatedIl = updatedIl;
++            }
++
++            public override MethodDesc OwningMethod => _method;
++            public override int MaxStack => _original.MaxStack;
++            public override bool IsInitLocals => _original.IsInitLocals;
++            public override byte[] GetILBytes() => _updatedIl;
++            public override LocalVariableDefinition[] GetLocals() => _original.GetLocals();
++            public override ILExceptionRegion[] GetExceptionRegions() => _original.GetExceptionRegions();
++            public override object GetObject(int token, NotFoundBehavior notFoundBehavior) =>
++                _original.GetObject(token, notFoundBehavior);
++            public override Internal.IL.MethodDebugInformation GetDebugInfo() => _original.GetDebugInfo();
++        }
++    }
++}
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalCodeStateValidator.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalCodeStateValidator.cs
+new file mode 100644
+index 000000000..f6c9229d6
+--- /dev/null
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/IncrementalCodeStateValidator.cs
+@@ -0,0 +1,52 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++using ILCompiler.DependencyAnalysis;
++
++namespace ILCompiler
++{
++    public static class IncrementalCodeStateValidator
++    {
++        public static bool Matches(
++            FrameInfo[] oldFrameInfos,
++            byte[] oldGcInfo,
++            bool oldHasEhInfo,
++            FrameInfo[] newFrameInfos,
++            byte[] newGcInfo,
++            bool newHasEhInfo,
++            out string reason)
++        {
++            if (oldHasEhInfo || newHasEhInfo)
++            {
++                reason = "exception-handling-info-present";
++                return false;
++            }
++            if (!((ReadOnlySpan<byte>)oldGcInfo).SequenceEqual(newGcInfo))
++            {
++                reason = "gc-info";
++                return false;
++            }
++
++            int oldFrameCount = oldFrameInfos?.Length ?? 0;
++            int newFrameCount = newFrameInfos?.Length ?? 0;
++            if (oldFrameCount != newFrameCount)
++            {
++                reason = "frame-count";
++                return false;
++            }
++            for (int i = 0; i < oldFrameCount; i++)
++            {
++                if (!oldFrameInfos[i].Equals(newFrameInfos[i]))
++                {
++                    reason = $"frame:{i}";
++                    return false;
++                }
++            }
++
++            reason = null;
++            return true;
++        }
++    }
++}
 diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
-index 98b214e2b..494814f02 100644
+index 98b214e2b..9844901c8 100644
 --- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
 +++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilation.cs
-@@ -6,0 +7 @@
+@@ -6,0 +7,2 @@
++using System.Diagnostics.CodeAnalysis;
 +using System.IO;
-@@ -101,0 +103,3 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -31,0 +34,4 @@ public sealed class RyuJitCompilation : Compilation
++        private readonly ILProvider _incrementalBaseILProvider;
++        private readonly string _incrementalBodyUpdateUnsupportedReason;
++        private List<MethodCodeNode> _preparedIncrementalDirtyMethods;
++        private IncrementalBodyUpdate _currentIncrementalUpdate;
+@@ -47,0 +54 @@ internal RyuJitCompilation(
++            string incrementalBodyUpdateUnsupportedReason,
+@@ -54,0 +62,2 @@ internal RyuJitCompilation(
++            _incrementalBaseILProvider = ilProvider;
++            _incrementalBodyUpdateUnsupportedReason = incrementalBodyUpdateUnsupportedReason;
+@@ -101,0 +111,3 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.SetCounter("configured-parallelism", _parallelism);
 +
 +            long dependencyGraphStart = CompilerProfile.GetTimestamp();
-@@ -102,0 +107 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -102,0 +115 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.RecordPhase("dependency-graph-and-codegen", dependencyGraphStart);
-@@ -103,0 +109 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -103,0 +117 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.SetCounter("marked-node-count", nodes.Length);
-@@ -104,0 +111 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -104,0 +119 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            long fileLayoutStart = CompilerProfile.GetTimestamp();
-@@ -105,0 +113 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -105,0 +121 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.RecordPhase("file-layout", fileLayoutStart);
-@@ -118,0 +127 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -107,0 +124 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
++            PrepareIncrementalObjectPatch(nodes);
+@@ -118,0 +136 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            long objectEmissionStart = CompilerProfile.GetTimestamp();
-@@ -119,0 +129,2 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
+@@ -119,0 +138,528 @@ protected override void CompileInternal(string outputFile, ObjectDumper dumper)
 +            CompilerProfile.RecordPhase("object-emission", objectEmissionStart);
 +            CompilerProfile.SetCounter("output-object-bytes", new FileInfo(outputFile).Length);
-@@ -149,0 +161,4 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
++
++            string incrementalCandidatesPath = Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_CANDIDATES_PATH");
++            if (!string.IsNullOrEmpty(incrementalCandidatesPath))
++            {
++                IncrementalBodyUpdate.WriteCandidates(
++                    CurrentILProvider,
++                    Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_BASE_ASSEMBLY"),
++                    nodes,
++                    NodeFactory,
++                    incrementalCandidatesPath);
++            }
++
++            string incrementalReemitPath = Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH");
++            if (!string.IsNullOrEmpty(incrementalReemitPath))
++            {
++                string baseAssemblyPath = Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_BASE_ASSEMBLY");
++                string updatedAssemblyPath = Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_UPDATED_ASSEMBLY");
++                if (string.IsNullOrEmpty(baseAssemblyPath) && string.IsNullOrEmpty(updatedAssemblyPath))
++                {
++                    ReemitObject(incrementalReemitPath, nodes, options);
++                }
++                else
++                {
++                    RunIncrementalBodyUpdate(
++                        incrementalReemitPath,
++                        baseAssemblyPath,
++                        updatedAssemblyPath,
++                        outputFile,
++                        nodes,
++                        options,
++                        metricSuffix: string.Empty);
++
++                    string secondIncrementalOutputPath =
++                        Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_REEMIT_PATH_2");
++                    string secondUpdatedAssemblyPath =
++                        Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_UPDATED_ASSEMBLY_2");
++                    string secondBaseAssemblyPath =
++                        Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_BASE_ASSEMBLY_2");
++                    if (!string.IsNullOrEmpty(secondIncrementalOutputPath) &&
++                        !string.IsNullOrEmpty(secondUpdatedAssemblyPath))
++                    {
++                        if (!string.IsNullOrEmpty(secondBaseAssemblyPath) &&
++                            !string.Equals(
++                                Path.GetFullPath(secondBaseAssemblyPath),
++                                Path.GetFullPath(baseAssemblyPath),
++                                StringComparison.OrdinalIgnoreCase))
++                        {
++                            ThrowIncrementalFallback("sequential-update-base-must-be-original-baseline");
++                        }
++
++                        RunIncrementalBodyUpdate(
++                            secondIncrementalOutputPath,
++                            baseAssemblyPath,
++                            secondUpdatedAssemblyPath,
++                            outputFile,
++                            nodes,
++                            options,
++                            metricSuffix: "-2");
++                    }
++                }
++            }
++        }
++
++        private void ReemitObject(
++            string incrementalReemitPath,
++            IReadOnlyCollection<DependencyNodeCore<NodeFactory>> nodes,
++            ObjectWritingOptions options,
++            string metricSuffix = "")
++        {
++            long incrementalReemitStart = CompilerProfile.GetTimestamp();
++            ObjectWriter.ObjectWriter.EmitObject(
++                incrementalReemitPath,
++                nodes,
++                NodeFactory,
++                options,
++                dumper: null,
++                _logger);
++            CompilerProfile.RecordPhase("incremental-reemit-object" + metricSuffix, incrementalReemitStart);
++            CompilerProfile.SetCounter(
++                "incremental-reemit-object-bytes" + metricSuffix,
++                new FileInfo(incrementalReemitPath).Length);
++        }
++
++        private void RunIncrementalBodyUpdate(
++            string incrementalOutputPath,
++            string baseAssemblyPath,
++            string updatedAssemblyPath,
++            string baseObjectPath,
++            IReadOnlyCollection<DependencyNodeCore<NodeFactory>> nodes,
++            ObjectWritingOptions options,
++            string metricSuffix)
++        {
++            if (_incrementalBodyUpdateUnsupportedReason is not null)
++            {
++                ThrowIncrementalFallback(
++                    $"unsupported-incremental-configuration:{_incrementalBodyUpdateUnsupportedReason}");
++            }
++
++            long incrementalUpdateStart = CompilerProfile.GetTimestamp();
++            long allocatedBytesBefore = GC.GetTotalAllocatedBytes();
++            using Process currentProcess = Process.GetCurrentProcess();
++            currentProcess.Refresh();
++            CompilerProfile.SetCounter(
++                "incremental-private-memory-bytes-before" + metricSuffix,
++                currentProcess.PrivateMemorySize64);
++            CompilerProfile.SetCounter(
++                "incremental-working-set-bytes-before" + metricSuffix,
++                currentProcess.WorkingSet64);
++
++            long shapeValidationStart = CompilerProfile.GetTimestamp();
++            if (!IncrementalBodyUpdate.TryCreate(
++                _incrementalBaseILProvider,
++                baseAssemblyPath,
++                updatedAssemblyPath,
++                allowUnchangedTarget: _currentIncrementalUpdate is not null,
++                out IncrementalBodyUpdate update,
++                out string reason))
++            {
++                ThrowIncrementalFallback(reason);
++            }
++            CompilerProfile.RecordPhase("incremental-shape-validation" + metricSuffix, shapeValidationStart);
++
++            long changedNodeSelectionStart = CompilerProfile.GetTimestamp();
++            var dirtyMethods = new List<MethodCodeNode>();
++            var dependencySnapshots = new List<IncrementalDependencySnapshot>();
++            var codeStateSnapshots = new List<IncrementalCodeStateSnapshot>();
++            int affectedMethodCount = update.GetAffectedMethodCount(_currentIncrementalUpdate);
++            if (_currentIncrementalUpdate is null &&
++                _preparedIncrementalDirtyMethods is not null &&
++                _preparedIncrementalDirtyMethods.Count == update.ChangedMethodCount)
++            {
++                foreach (MethodCodeNode methodCodeNode in _preparedIncrementalDirtyMethods)
++                {
++                    if (!update.IsChangedMethod(methodCodeNode.Method))
++                    {
++                        dirtyMethods.Clear();
++                        break;
++                    }
++                    dirtyMethods.Add(methodCodeNode);
++                }
++            }
++
++            if (dirtyMethods.Count == 0)
++            {
++                foreach (DependencyNodeCore<NodeFactory> node in nodes)
++                {
++                    if (node is MethodCodeNode methodCodeNode &&
++                        update.IsAffectedMethod(methodCodeNode.Method, _currentIncrementalUpdate))
++                    {
++                        dirtyMethods.Add(methodCodeNode);
++                    }
++                }
++            }
++
++            foreach (MethodCodeNode methodCodeNode in dirtyMethods)
++            {
++                MethodDesc method = methodCodeNode.Method;
++                if (method.HasInstantiation ||
++                    method.OwningType.HasInstantiation ||
++                    methodCodeNode.IsSpecialUnboxingThunk ||
++                    methodCodeNode.HasConditionalStaticDependencies ||
++                    NodeFactory.CanFoldMethodBodyForIncrementalCompilation(method))
++                {
++                    ThrowIncrementalFallback($"changed-method-node-is-not-eligible:{method}");
++                }
++                if (!update.CanOverlayChangedMethod(method, out reason))
++                {
++                    ThrowIncrementalFallback($"{reason}:{method}");
++                }
++
++                dependencySnapshots.Add(IncrementalDependencySnapshot.Capture(methodCodeNode, NodeFactory));
++                codeStateSnapshots.Add(IncrementalCodeStateSnapshot.Capture(methodCodeNode));
++            }
++            CompilerProfile.RecordPhase("incremental-select-changed-nodes" + metricSuffix, changedNodeSelectionStart);
++
++            if (dirtyMethods.Count != affectedMethodCount)
++            {
++                ThrowIncrementalFallback(
++                    $"changed-method-node-count-mismatch:{affectedMethodCount}:{dirtyMethods.Count}",
++                    update.ChangedMethodCount,
++                    dirtyMethods.Count);
++            }
++
++            ReplaceILProviderForIncrementalCompilation(update);
++            foreach (MethodCodeNode method in dirtyMethods)
++            {
++                method.ResetForIncrementalCompilation();
++            }
++
++            long incrementalCodegenStart = CompilerProfile.GetTimestamp();
++            CompileSingleThreaded(dirtyMethods, profileMethods: false);
++            CompilerProfile.RecordPhase("incremental-method-codegen" + metricSuffix, incrementalCodegenStart);
++
++            long validationStart = CompilerProfile.GetTimestamp();
++            for (int i = 0; i < dirtyMethods.Count; i++)
++            {
++                if (!dependencySnapshots[i].Matches(dirtyMethods[i], NodeFactory, out reason))
++                {
++                    ThrowIncrementalFallback(
++                        $"dependency-fingerprint-changed:{dirtyMethods[i].Method}:{reason}",
++                        update.ChangedMethodCount,
++                        dirtyMethods.Count);
++                }
++                if (!codeStateSnapshots[i].Matches(dirtyMethods[i], out reason))
++                {
++                    ThrowIncrementalFallback(
++                        $"code-state-changed:{dirtyMethods[i].Method}:{reason}",
++                        update.ChangedMethodCount,
++                        dirtyMethods.Count);
++                }
++            }
++            CompilerProfile.RecordPhase("incremental-validate-codegen" + metricSuffix, validationStart);
++
++            CompilerProfile.SetCounter(
++                "incremental-changed-method-definitions" + metricSuffix,
++                update.ChangedMethodCount);
++            CompilerProfile.SetCounter(
++                "incremental-recompiled-code-nodes" + metricSuffix,
++                dirtyMethods.Count);
++            if (string.Equals(
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                "1",
++                StringComparison.Ordinal))
++            {
++                if (options.HasFlag(ObjectWritingOptions.GenerateDebugInfo))
++                {
++                    ThrowIncrementalFallback(
++                        "fast-object-patch-does-not-support-debug-info",
++                        update.ChangedMethodCount,
++                        dirtyMethods.Count);
++                }
++
++                long objectPatchStart = CompilerProfile.GetTimestamp();
++                if (!IncrementalObjectPatch.TryPatch(
++                    baseObjectPath,
++                    incrementalOutputPath,
++                    dirtyMethods,
++                    NodeFactory,
++                    out reason,
++                    out long patchedByteCount))
++                {
++                    ThrowIncrementalFallback(
++                        $"fast-object-patch-rejected:{reason}",
++                        update.ChangedMethodCount,
++                        dirtyMethods.Count);
++                }
++                CompilerProfile.RecordPhase("incremental-patch-object" + metricSuffix, objectPatchStart);
++                CompilerProfile.SetCounter(
++                    "incremental-patched-object-bytes" + metricSuffix,
++                    patchedByteCount);
++                CompilerProfile.SetCounter(
++                    "incremental-reemit-object-bytes" + metricSuffix,
++                    new FileInfo(incrementalOutputPath).Length);
++            }
++            else
++            {
++                ReemitObject(incrementalOutputPath, nodes, options, metricSuffix);
++            }
++            if (string.Equals(
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FORCE_GC_BETWEEN_UPDATES"),
++                "1",
++                StringComparison.Ordinal))
++            {
++                long forcedGcStart = CompilerProfile.GetTimestamp();
++                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
++                CompilerProfile.RecordPhase("incremental-forced-gc" + metricSuffix, forcedGcStart);
++            }
++            currentProcess.Refresh();
++            CompilerProfile.SetCounter(
++                "incremental-allocated-bytes" + metricSuffix,
++                GC.GetTotalAllocatedBytes() - allocatedBytesBefore);
++            CompilerProfile.SetCounter(
++                "incremental-private-memory-bytes-after" + metricSuffix,
++                currentProcess.PrivateMemorySize64);
++            CompilerProfile.SetCounter(
++                "incremental-working-set-bytes-after" + metricSuffix,
++                currentProcess.WorkingSet64);
++            CompilerProfile.RecordPhase("incremental-update-total" + metricSuffix, incrementalUpdateStart);
++            _currentIncrementalUpdate = update;
++            WriteIncrementalStatus("success", null, update.ChangedMethodCount, dirtyMethods.Count);
++        }
++
++        private void PrepareIncrementalObjectPatch(
++            IReadOnlyCollection<DependencyNodeCore<NodeFactory>> nodes)
++        {
++            if (!string.Equals(
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_FAST_OBJECT_PATCH"),
++                "1",
++                StringComparison.Ordinal) ||
++                _incrementalBodyUpdateUnsupportedReason is not null)
++            {
++                return;
++            }
++
++            if (!IncrementalBodyUpdate.TryCreate(
++                _incrementalBaseILProvider,
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_BASE_ASSEMBLY"),
++                Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_UPDATED_ASSEMBLY"),
++                allowUnchangedTarget: false,
++                out IncrementalBodyUpdate update,
++                out _))
++            {
++                return;
++            }
++
++            var changedNodes = new List<ObjectNode>();
++            var dirtyMethods = new List<MethodCodeNode>();
++            int objectNodeCount = 0;
++            foreach (DependencyNodeCore<NodeFactory> node in nodes)
++            {
++                if (node is not ObjectNode objectNode)
++                {
++                    continue;
++                }
++
++                objectNodeCount++;
++                if (objectNode is MethodCodeNode methodCodeNode &&
++                    update.IsChangedMethod(methodCodeNode.Method))
++                {
++                    changedNodes.Add(methodCodeNode);
++                    dirtyMethods.Add(methodCodeNode);
++                }
++            }
++            CompilerProfile.SetCounter("incremental-object-node-count", objectNodeCount);
++            CompilerProfile.SetCounter("incremental-recorded-object-node-count", changedNodes.Count);
++            CompilerProfile.SetCounter("incremental-reused-object-node-count", objectNodeCount - changedNodes.Count);
++            _preparedIncrementalDirtyMethods = dirtyMethods;
++            IncrementalObjectPatch.Begin(changedNodes);
++        }
++
++        [DoesNotReturn]
++        private static void ThrowIncrementalFallback(
++            string reason,
++            int changedMethodCount = 0,
++            int recompiledNodeCount = 0)
++        {
++            WriteIncrementalStatus("fallback", reason, changedMethodCount, recompiledNodeCount);
++            throw new InvalidOperationException($"Incremental compilation fallback required: {reason}");
++        }
++
++        private static void WriteIncrementalStatus(
++            string result,
++            string reason,
++            int changedMethodCount,
++            int recompiledNodeCount)
++        {
++            string statusPath = Environment.GetEnvironmentVariable("DOTNET_ILC_INCREMENTAL_STATUS_PATH");
++            if (string.IsNullOrEmpty(statusPath))
++            {
++                return;
++            }
++
++            File.WriteAllLines(
++                statusPath,
++                new string[]
++                {
++                    $"result={result}",
++                    $"reason={reason ?? string.Empty}",
++                    $"changed-method-definitions={changedMethodCount}",
++                    $"recompiled-code-nodes={recompiledNodeCount}",
++                });
++        }
++
++        private sealed class IncrementalDependencySnapshot
++        {
++            private readonly DependencyEntry[] _staticDependencies;
++            private readonly CombinedDependencyEntry[] _conditionalDependencies;
++
++            private IncrementalDependencySnapshot(
++                DependencyEntry[] staticDependencies,
++                CombinedDependencyEntry[] conditionalDependencies)
++            {
++                _staticDependencies = staticDependencies;
++                _conditionalDependencies = conditionalDependencies;
++            }
++
++            public static IncrementalDependencySnapshot Capture(MethodCodeNode node, NodeFactory factory)
++            {
++                var staticDependencies = new List<DependencyEntry>();
++                foreach (DependencyNodeCore<NodeFactory>.DependencyListEntry dependency in node.GetStaticDependencies(factory))
++                {
++                    staticDependencies.Add(new DependencyEntry(dependency.Node, dependency.Reason));
++                }
++
++                var conditionalDependencies = new List<CombinedDependencyEntry>();
++                foreach (DependencyNodeCore<NodeFactory>.CombinedDependencyListEntry dependency in node.GetConditionalStaticDependencies(factory))
++                {
++                    conditionalDependencies.Add(new CombinedDependencyEntry(
++                        dependency.Node,
++                        dependency.OtherReasonNode,
++                        dependency.Reason));
++                }
++
++                return new IncrementalDependencySnapshot(
++                    staticDependencies.ToArray(),
++                    conditionalDependencies.ToArray());
++            }
++
++            public bool Matches(MethodCodeNode node, NodeFactory factory, out string reason)
++            {
++                int index = 0;
++                foreach (DependencyNodeCore<NodeFactory>.DependencyListEntry dependency in node.GetStaticDependencies(factory))
++                {
++                    if (!dependency.Node.Marked)
++                    {
++                        reason = $"unmarked-static-entry:{index}";
++                        return false;
++                    }
++                    if (index >= _staticDependencies.Length ||
++                        !_staticDependencies[index].Matches(dependency))
++                    {
++                        reason = $"static-entry:{index}";
++                        return false;
++                    }
++                    index++;
++                }
++                if (index != _staticDependencies.Length)
++                {
++                    reason = $"static-count:{_staticDependencies.Length}:{index}";
++                    return false;
++                }
++
++                index = 0;
++                foreach (DependencyNodeCore<NodeFactory>.CombinedDependencyListEntry dependency in node.GetConditionalStaticDependencies(factory))
++                {
++                    if (!dependency.Node.Marked || !dependency.OtherReasonNode.Marked)
++                    {
++                        reason = $"unmarked-conditional-entry:{index}";
++                        return false;
++                    }
++                    if (index >= _conditionalDependencies.Length ||
++                        !_conditionalDependencies[index].Matches(dependency))
++                    {
++                        reason = $"conditional-entry:{index}";
++                        return false;
++                    }
++                    index++;
++                }
++                if (index != _conditionalDependencies.Length)
++                {
++                    reason = $"conditional-count:{_conditionalDependencies.Length}:{index}";
++                    return false;
++                }
++
++                reason = null;
++                return true;
++            }
++
++            private readonly struct DependencyEntry
++            {
++                private readonly DependencyNodeCore<NodeFactory> _node;
++                private readonly string _reason;
++
++                public DependencyEntry(DependencyNodeCore<NodeFactory> node, string reason)
++                {
++                    _node = node;
++                    _reason = reason;
++                }
++
++                public bool Matches(DependencyNodeCore<NodeFactory>.DependencyListEntry dependency)
++                {
++                    return ReferenceEquals(_node, dependency.Node) &&
++                        string.Equals(_reason, dependency.Reason, StringComparison.Ordinal);
++                }
++            }
++
++            private readonly struct CombinedDependencyEntry
++            {
++                private readonly DependencyNodeCore<NodeFactory> _node;
++                private readonly DependencyNodeCore<NodeFactory> _otherReasonNode;
++                private readonly string _reason;
++
++                public CombinedDependencyEntry(
++                    DependencyNodeCore<NodeFactory> node,
++                    DependencyNodeCore<NodeFactory> otherReasonNode,
++                    string reason)
++                {
++                    _node = node;
++                    _otherReasonNode = otherReasonNode;
++                    _reason = reason;
++                }
++
++                public bool Matches(DependencyNodeCore<NodeFactory>.CombinedDependencyListEntry dependency)
++                {
++                    return ReferenceEquals(_node, dependency.Node) &&
++                        ReferenceEquals(_otherReasonNode, dependency.OtherReasonNode) &&
++                        string.Equals(_reason, dependency.Reason, StringComparison.Ordinal);
++                }
++            }
++        }
++
++        private sealed class IncrementalCodeStateSnapshot
++        {
++            private readonly FrameInfo[] _frameInfos;
++            private readonly byte[] _gcInfo;
++            private readonly bool _hasEhInfo;
++
++            private IncrementalCodeStateSnapshot(
++                FrameInfo[] frameInfos,
++                byte[] gcInfo,
++                bool hasEhInfo)
++            {
++                _frameInfos = frameInfos;
++                _gcInfo = gcInfo;
++                _hasEhInfo = hasEhInfo;
++            }
++
++            public static IncrementalCodeStateSnapshot Capture(MethodCodeNode node)
++            {
++                return new IncrementalCodeStateSnapshot(
++                    node.FrameInfos,
++                    node.GCInfo,
++                    node.EHInfo is not null);
++            }
++
++            public bool Matches(MethodCodeNode node, out string reason)
++            {
++                return IncrementalCodeStateValidator.Matches(
++                    _frameInfos,
++                    _gcInfo,
++                    _hasEhInfo,
++                    node.FrameInfos,
++                    node.GCInfo,
++                    node.EHInfo is not null,
++                    out reason);
++            }
+@@ -149,0 +696,4 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
 +            CompilerProfile.AddCounter("dependency-batch-count", 1);
 +            CompilerProfile.AddCounter("methods-queued-for-codegen", methodsToCompile.Count);
 +
 +            long methodCodegenStart = CompilerProfile.GetTimestamp();
-@@ -152 +167 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+@@ -152 +702 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
 -                CompileSingleThreaded(methodsToCompile);
 +                CompileSingleThreaded(methodsToCompile, CompilerProfile.MethodProfilingEnabled);
-@@ -156 +171 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+@@ -156 +706 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
 -                CompileMultiThreaded(methodsToCompile);
 +                CompileMultiThreaded(methodsToCompile, CompilerProfile.MethodProfilingEnabled);
-@@ -157,0 +173 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+@@ -157,0 +708 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
 +            CompilerProfile.RecordPhase("method-codegen-batches-wall", methodCodegenStart);
-@@ -159 +175,2 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
+@@ -159 +710,2 @@ protected override void ComputeDependencyNodeDependencies(List<DependencyNodeCor
 -        private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
 +
 +        private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile, bool profileMethods)
-@@ -165,0 +183 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
+@@ -165,0 +718 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
 +            Action<MethodCodeNode> compileMethod = profileMethods ? CompileSingleMethodProfiled : CompileSingleMethod;
-@@ -169 +187 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
+@@ -169 +722 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
 -                CompileSingleMethod);
 +                compileMethod);
-@@ -172,2 +190 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
+@@ -172,2 +725 @@ private void CompileMultiThreaded(List<MethodCodeNode> methodsToCompile)
 -
 -        private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile)
 +        private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile, bool profileMethods)
-@@ -184 +201,8 @@ private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile)
+@@ -184 +736,8 @@ private void CompileSingleThreaded(List<MethodCodeNode> methodsToCompile)
 -                CompileSingleMethod(corInfo, methodCodeNodeNeedingCode);
 +                if (profileMethods)
 +                {
@@ -3237,7 +5296,7 @@ index 98b214e2b..494814f02 100644
 +                {
 +                    CompileSingleMethod(corInfo, methodCodeNodeNeedingCode);
 +                }
-@@ -194 +218,7 @@ private void CompileSingleMethod(MethodCodeNode methodCodeNodeNeedingCode)
+@@ -194 +753,7 @@ private void CompileSingleMethod(MethodCodeNode methodCodeNodeNeedingCode)
 -        private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
 +        private void CompileSingleMethodProfiled(MethodCodeNode methodCodeNodeNeedingCode)
 +        {
@@ -3246,7 +5305,7 @@ index 98b214e2b..494814f02 100644
 +        }
 +
 +        private void CompileSingleMethodProfiled(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
-@@ -196,0 +227,11 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -196,0 +762,11 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 +            long methodStart = CompilerProfile.StartMethod();
 +            bool usedFallbackBody = false;
 +            try
@@ -3258,14 +5317,14 @@ index 98b214e2b..494814f02 100644
 +                CompilerProfile.RecordMethod(method, methodStart, usedFallbackBody);
 +            }
 +        }
-@@ -197,0 +239,3 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -197,0 +774,3 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 +        private bool CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeNodeNeedingCode)
 +        {
 +            MethodDesc method = methodCodeNodeNeedingCode.Method;
-@@ -214 +258 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -214 +793 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 -            if (exception != null)
 +            if (exception == null)
-@@ -216,10 +260,2 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -216,10 +795,2 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 -                if (exception is TypeSystemException.InvalidProgramException
 -                    && method.OwningType is MetadataType mdOwningType
 -                    && mdOwningType.HasCustomAttribute("System.Runtime.InteropServices", "ClassInterfaceAttribute"))
@@ -3278,7 +5337,7 @@ index 98b214e2b..494814f02 100644
 -                    Logger.LogError($"Method will always throw because: {exception.Message}", 1005, method, MessageSubCategory.AotAnalysis);
 +                return false;
 +            }
-@@ -227,3 +263,5 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -227,3 +798,5 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 -                // Try to compile the method again, but with a throwing method body this time.
 -                MethodIL throwingIL = TypeSystemThrowingILEmitter.EmitIL(method, exception);
 -                corInfo.CompileMethod(methodCodeNodeNeedingCode, throwingIL);
@@ -3287,7 +5346,7 @@ index 98b214e2b..494814f02 100644
 +                && mdOwningType.HasCustomAttribute("System.Runtime.InteropServices", "ClassInterfaceAttribute"))
 +            {
 +                Logger.LogWarning(method, DiagnosticId.COMInteropNotSupportedInFullAOT);
-@@ -230,0 +269,10 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
+@@ -230,0 +804,10 @@ private void CompileSingleMethod(CorInfoImpl corInfo, MethodCodeNode methodCodeN
 +            if ((_compilationOptions & RyuJitCompilationOptions.UseResilience) != 0)
 +                Logger.LogMessage($"Method '{method}' will always throw because: {exception.Message}");
 +            else
@@ -3298,34 +5357,90 @@ index 98b214e2b..494814f02 100644
 +            corInfo.CompileMethod(methodCodeNodeNeedingCode, throwingIL);
 +
 +            return true;
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilationBuilder.cs b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilationBuilder.cs
+index d4c69d52a..c2da7f967 100644
+--- a/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilationBuilder.cs
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/Compiler/RyuJitCompilationBuilder.cs
+@@ -25,0 +26,2 @@ public sealed class RyuJitCompilationBuilder : CompilationBuilder
++        private readonly bool _scannerEnabled;
++        private readonly bool _preinitializationEnabled;
+@@ -27,0 +30,9 @@ public RyuJitCompilationBuilder(CompilerTypeSystemContext context, CompilationMo
++            : this(context, group, scannerEnabled: true, preinitializationEnabled: true)
++        {
++        }
++
++        public RyuJitCompilationBuilder(
++            CompilerTypeSystemContext context,
++            CompilationModuleGroup group,
++            bool scannerEnabled,
++            bool preinitializationEnabled)
+@@ -30,0 +42,2 @@ public RyuJitCompilationBuilder(CompilerTypeSystemContext context, CompilationMo
++            _scannerEnabled = scannerEnabled;
++            _preinitializationEnabled = preinitializationEnabled;
+@@ -144,0 +158,8 @@ public override ICompilation ToCompilation()
++            string incrementalBodyUpdateUnsupportedReason =
++                _scannerEnabled ? "scanner-enabled" :
++                _preinitializationEnabled ? "preinitialization-enabled" :
++                _optimizationMode != OptimizationMode.None ? "optimizations-enabled" :
++                _methodBodyFolding != MethodBodyFoldingMode.None ? "method-body-folding-enabled" :
++                _debugInformationProvider is not NullDebugInformationProvider ? "native-debug-info-enabled" :
++                _inliningPolicy is not null ? "custom-inlining-policy" :
++                null;
+@@ -161,0 +183 @@ public override ICompilation ToCompilation()
++                incrementalBodyUpdateUnsupportedReason,
+diff --git a/src/coreclr/tools/aot/ILCompiler.RyuJit/ILCompiler.RyuJit.csproj b/src/coreclr/tools/aot/ILCompiler.RyuJit/ILCompiler.RyuJit.csproj
+index 8fa7b6865..6822b44b5 100644
+--- a/src/coreclr/tools/aot/ILCompiler.RyuJit/ILCompiler.RyuJit.csproj
++++ b/src/coreclr/tools/aot/ILCompiler.RyuJit/ILCompiler.RyuJit.csproj
+@@ -30,0 +31,2 @@
++    <Compile Include="Compiler\IncrementalBodyUpdate.cs" />
++    <Compile Include="Compiler\IncrementalCodeStateValidator.cs" />
 diff --git a/src/coreclr/tools/aot/ILCompiler/Program.cs b/src/coreclr/tools/aot/ILCompiler/Program.cs
-index 04795875d..d7d5ea1dd 100644
+index 04795875d..fea49b92e 100644
 --- a/src/coreclr/tools/aot/ILCompiler/Program.cs
 +++ b/src/coreclr/tools/aot/ILCompiler/Program.cs
 @@ -73,0 +74 @@ public int Run()
 +            long initializationStart = CompilerProfile.Initialize();
-@@ -489,0 +491,2 @@ public int Run()
+@@ -360,0 +362,4 @@ public int Run()
++            bool preinitStatics = Get(_command.PreinitStatics) ||
++                (_command.OptimizationMode != OptimizationMode.None && !multiFile);
++            preinitStatics &= !Get(_command.NoPreinitStatics);
++
+@@ -362 +367,5 @@ public int Run()
+-            var builder = new RyuJitCompilationBuilder(typeSystemContext, compilationGroup)
++            var builder = new RyuJitCompilationBuilder(
++                    typeSystemContext,
++                    compilationGroup,
++                    useScanner,
++                    preinitStatics)
+@@ -470,5 +478,0 @@ public int Run()
+-            // Enable static data preinitialization in optimized builds.
+-            bool preinitStatics = Get(_command.PreinitStatics) ||
+-                (_command.OptimizationMode != OptimizationMode.None && !multiFile);
+-            preinitStatics &= !Get(_command.NoPreinitStatics);
+-
+@@ -489,0 +494,2 @@ public int Run()
 +            CompilerProfile.RecordPhase("input-and-type-system-setup", initializationStart);
 +            CompilerProfile.SetCounter("scanner-enabled", useScanner ? 1 : 0);
-@@ -491,0 +495 @@ public int Run()
+@@ -491,0 +498 @@ public int Run()
 +                long scannerStart = CompilerProfile.GetTimestamp();
-@@ -494,0 +499,5 @@ public int Run()
+@@ -494,0 +502 @@ public int Run()
 +                CompilerProfile.RecordPhase("scanner-and-analysis-integration", scannerStart);
-+            }
+@@ -495,0 +504,6 @@ public int Run()
 +            else
 +            {
 +                CompilerProfile.RecordSkippedPhase("scanner-and-analysis-integration");
-@@ -496,0 +506,2 @@ public int Run()
-+            long compilationSetupStart = CompilerProfile.GetTimestamp();
++            }
 +
-@@ -627,0 +639 @@ void RunScanner()
++            long compilationSetupStart = CompilerProfile.GetTimestamp();
+@@ -627,0 +642 @@ void RunScanner()
 +            CompilerProfile.RecordPhase("compilation-setup", compilationSetupStart);
-@@ -643,0 +656 @@ void RunScanner()
+@@ -643,0 +659 @@ void RunScanner()
 +            long compilationStart = CompilerProfile.GetTimestamp();
-@@ -644,0 +658,2 @@ void RunScanner()
+@@ -644,0 +661,2 @@ void RunScanner()
 +            CompilerProfile.RecordPhase("compilation-total", compilationStart);
 +            long finalizationStart = CompilerProfile.GetTimestamp();
-@@ -718,0 +734,3 @@ static bool IsRelatedToInvalidInput(MethodDesc method)
+@@ -718,0 +737,3 @@ static bool IsRelatedToInvalidInput(MethodDesc method)
 +            CompilerProfile.RecordPhase("finalization", finalizationStart);
 +            CompilerProfile.WriteReport();
 +

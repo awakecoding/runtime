@@ -42,6 +42,11 @@ speedup. The strongest new standalone result was concrete dependency-list iterat
 170.0 million entries avoided interface enumeration, cutting 1.35-1.39 GiB of allocation and
 about 7.3 seconds from graph/mark time.
 
+For a strictly gated body-only edit, retaining the completed graph changes the result
+completely: the hardened RDM object patch took 254.251 ms and reproduced the independent
+clean object's SHA-256 exactly. The unchanged native link still takes 36.55 seconds, so the
+measured end-to-end edit/link loop is about 36.8 seconds instead of roughly 10-11 minutes.
+
 ## Exact baseline
 
 | Item | Value |
@@ -551,6 +556,9 @@ was transient late in object writing. Phase-aligned samples were lower than cont
 end (16.69 versus 17.20 GiB), materialization end (28.90 versus 29.89 GiB), and object end
 (32.16 versus 33.62 GiB). The result is therefore retained-heap/GC-shape variability rather
 than evidence of higher cumulative allocation, but it remains a deployment-capacity caveat.
+Control D, combined, and control E performed 154/78/35, 156/76/35, and 157/82/34
+gen0/gen1/gen2 collections respectively, which is consistent with changed collection timing
+rather than a new collection-count regression.
 
 The final object linked successfully in 53.89 seconds to a 1,038,627,840-byte executable with
 SHA-256 `D009CB3EDF31E457C93C6FE99520A53F64C26D7CD39F58A57624A3CB9E854819`.
@@ -610,6 +618,196 @@ are in `11-combined-all-waves\link-metadata.json` and `smoke-metadata.json`.
    already-parallel fraction; linking remains tens of seconds. Neither addresses the measured
    serial graph and object costs.
 
+## Incremental body-only compilation prototype
+
+The incremental experiment tests whether a long-lived ILC process can reuse its whole-program
+state for a dependency-neutral method-body edit. It targets the RDM fast profile specifically:
+minopts, scanner disabled, preinitialization disabled, no method folding, and no native debug
+data.
+
+This is a feasibility prototype, not an integrated incremental build feature. The current
+runner performs a baseline compilation and an incremental update in one ILC process. The
+reported incremental phase is what a future daemon request would cost after that process has
+retained the graph. Launching the runner from a cold process still pays the baseline first.
+
+### Reusable state and one-shot invariants
+
+The first unchanged-input spike found three destructive assumptions in normal object emission:
+
+* `ExternalReferencesTableNode` discards its symbol dictionary after emission;
+* GVM table nodes discard their construction dictionaries;
+* relocation resolution patches bytes directly into cached `ObjectData`.
+
+The experiment preserves those dictionaries and clones relocatable bytes only when the
+incremental environment is enabled. Tiny and EntryModel then produced byte-identical primary
+and second emissions:
+
+| Workload | First object emission | Frozen-graph re-emission | Output identity |
+| --- | ---: | ---: | --- |
+| Tiny console | 467.8 ms | 58.8 ms | identical 3,148,430-byte OBJ |
+| EntryModel | 2,213.7 ms | 1,294.2 ms | identical 95,437,303-byte OBJ |
+
+### Eligibility and clean fallback
+
+`IncrementalBodyUpdate` compares the complete base and updated PE images after masking only:
+
+* MethodDef body ranges;
+* deterministic PE timestamp and checksum;
+* debug-directory and strong-name signature payloads.
+
+All remaining bytes, including the MVID, must match. Changed bodies must retain size, max
+stack, locals, EH shape, method/type generic shape, and token layout. The compiler also
+requires minopts with scanner, preinitialization, method folding, and native debug output
+disabled; otherwise it clean-falls back before reuse. This prevents retained inlined callers,
+scanner facts, or preinitialized data from silently embedding the old body. The strict mode
+initially admits only nongeneric, nonconstructor arithmetic bodies with constant operand
+changes. A speculative test mode allows broader bodies but still requires exact post-codegen
+dependency, GC-info, unwind/frame, and object-fragment equality.
+
+Every method's header and EH shape is checked even when its IL bytes are unchanged. A changed
+method must also resolve to an overlayable ECMA IL definition. The compiler resets the union
+of the previous and current target's affected `MethodCodeNode` code, GC, EH, debug, local-type,
+and non-relocation dependency state. This makes a later value, different offset, or revert to
+the baseline recompile the retained node instead of leaving stale state. It then compares
+ordered dependency fingerprints by node identity and reason; every dependency must already
+be marked. A failed check writes an explicit fallback reason and exits;
+`Invoke-IncrementalIlcPrototype.ps1` then starts a clean updated compilation. Unexpected
+compiler failures are not converted into successful fallbacks. Before starting ILC, the
+runner also requires the base and updated response files to match after normalizing only the
+changed input assembly and output-only destinations. Any other compiler input or option
+change selects a clean build with `response-semantics-changed`.
+
+The tiny matrix validated:
+
+| Change | Result |
+| --- | --- |
+| One or two eligible constant edits | incremental hit; byte-identical to clean v2 |
+| Changed call target | clean fallback: dependency fingerprint changed |
+| New previously unmarked target | clean fallback: unmarked static dependency |
+| Generic method/type | clean fallback: generic method or type changed |
+| Static constructor | clean fallback: constructor changed |
+| EH-bearing method | clean fallback before reuse; code-state validator also rejects EH |
+| Signature or type layout | clean fallback: assembly/body shape changed |
+| Debug-data change | clean fallback; fast patch explicitly forbids debug output |
+| MVID change | clean fallback: module version ID changed |
+| Foldable method | clean fallback: changed node is not eligible |
+| Malformed/unsupported IL | clean compile or build failure; never stale reuse |
+| Strong-name payload change | normalized safely when all signed metadata is unchanged |
+
+Unit tests additionally cover changed object size, alignment, defined symbols, relocation
+target/addend, GC info, frame info/count, EH state, COMDAT, missing/out-of-bounds location,
+duplicate node, overlapping patch offsets, an unexpected base byte, and an existing output.
+The final compiler test run passed all 40 tests. Separate wrapper checks confirmed a
+clean-validated incremental hit, ambient environment isolation, and a response-semantics
+clean fallback. Direct negative runs confirmed explicit MVID and optimized-configuration
+fallbacks.
+
+### Full object re-emission
+
+The first implementation reused the graph but ran a fresh `ObjectWriter`:
+
+| Pair | Clean v2 ILC | Incremental phase | Speedup | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| RDM edit 1 | 592.580 s | 160.421 s | 3.69x | 72.93% |
+| RDM edit 2 | 619.125 s | 181.436 s | 3.41x | 70.69% |
+
+Both pairs recompiled one method in 15-28 ms and produced the exact clean-v2
+3,744,339,247-byte object. The pair-2 hash is
+`B3140045782498DC4A06F712C2DAA329B732D6340DFCD3D80AD4181E17844206`.
+The remaining 158-170 seconds were almost entirely object materialization, symbols,
+relocations, and file writing.
+
+### Correctness-gated object patch
+
+For non-COMDAT methods with unchanged code size, alignment, defined symbols, relocations,
+relocation addends, GC info, unwind/frame info, and no EH/debug data, the prototype records
+the changed node's file location during the baseline emission. An incremental request copies
+the cached object and patches only changed non-relocation bytes after confirming the cached
+bytes at those offsets still match. It writes and flushes a temporary object, closes it, and
+atomically moves it to the result path before reporting success.
+
+The controlled RDM edit changed one `ldc.i4.s` operand in reachable
+`Program.BuildModuleViewIndex`. The dirty RDM worktree was not modified; the changed DLL was
+created under `artifacts`. This real-workload candidate required the explicitly experimental
+unsafe-body-shape switch; the evidence for accepting the result is the post-codegen state
+guards plus exact identity with an independent clean v2 object, not the strict leaf whitelist.
+
+The first measured path took 180.848 ms before review. Adding original-byte validation and
+atomic temporary-file persistence produced this final hardened result:
+
+| Metric | Hardened fast-path result |
+| --- | ---: |
+| Clean v2 ILC | 619.125 s |
+| Incremental update | 254.251 ms |
+| Speedup | 2,435.09x |
+| Reduction | 99.9589% |
+| Shape validation | 8.336 ms |
+| Retained changed-node lookup | 5.790 ms |
+| Code generation | 19.536 ms |
+| Dependency/code-state validation | 4.026 ms |
+| Durable atomic object copy/patch | 171.533 ms |
+| Patched bytes | 1 |
+| Incremental managed allocation | 1,571,776 bytes |
+| Object nodes reused | 13,455,307 of 13,455,308 |
+| Private bytes before/after | 36,319,535,104 / 36,320,284,672 (+749,568) |
+
+The incremental object exactly matched clean v2 with SHA-256
+`B3140045782498DC4A06F712C2DAA329B732D6340DFCD3D80AD4181E17844206`.
+A fresh process confirmed that the hardened compiler was
+`D88A7AB04D52FB51447EEAA4467A5C276AB4B2483BB0555E539715A6A3534724`
+(`ilc.dll` SHA-256).
+A fresh PowerShell process reread and hashed the 3.744 GB object in 2.42 seconds. This verifies
+persistence, but the readback was still subject to the operating-system file cache and is not
+presented as cold-storage throughput.
+
+The object linked in 36.55 seconds to a 1,038,627,840-byte executable with SHA-256
+`37B1CB1033CAAA4E43922894610F5701B197E835F6B20EEF79FA0A18B0B2476F`.
+The GUI process remained alive for a 20-second startup smoke test and was stopped by exact PID.
+Including the unchanged native linker, a developer iteration is therefore about 36.8 seconds
+instead of roughly 10-11 minutes. The modified module-view index is not directly observable
+through the available smoke automation; byte identity with clean v2 proves the same edited
+native program was linked.
+
+Under the hardened minopts gate, two sequential EntryModel full re-emissions produced distinct
+objects with hashes `7E51DE2040A13378D9EB3EFF74BB3E62C3DB82DCD25F1BBCC172AABD4E05D2A0`
+and `4307828F9E4508CAE0665DB60FDCF14CCFB4C3BD0CF4D8968DC3C289D169931E`;
+each exactly matched its independent clean target. With a forced compacting GC between those
+updates, private memory was 915,951,616 bytes before update 1, 917,749,760 after it, and
+895,598,592 after update 2. EntryModel's fast patch correctly clean-fell back because its
+relocation addend changed. The earlier optimized EntryModel fast-path run is excluded from the
+hardened result because retained inlined callers could not be proven safe.
+
+The hardened tiny fast path covered an update and revert in one process: update 1 matched its
+clean target and update 2 restored the exact baseline object. Private bytes moved from
+179,597,312 to 179,621,888 and remained at 179,621,888 after the revert. A separate tiny case
+covered a two-method edit. Across these cases, changed bytes and offsets did not leave stale
+cached method state.
+
+### Incremental conclusion
+
+Whole-program analysis does not prevent large incremental gains for a narrow, provably
+dependency-neutral body edit. The graph can be reused safely when all consumed global facts
+are unchanged, and symbolic object fragments can avoid almost all re-emission work.
+
+The next engineering step is a real idle-timeout ILC daemon or worker protocol that retains
+the approximately 34-36 GiB compiler state between MSBuild invocations. It must preserve the
+same strict fallback contract, support compiler/configuration cache invalidation, and decide
+how to invalidate and rebuild MVID-dependent metadata; the current prototype rejects any MVID
+change.
+Broader edits require tracked inlining, preinitialization, reflection, generic, debug, COMDAT,
+and global-table invalidation before they can enter the fast path.
+
+Raw evidence is under `artifacts\nativeaot-profile\incremental`. The main files are:
+
+* `rdm-incremental-summary.csv`;
+* `matrix-runs\matrix-results.csv`;
+* `hardening-results.csv`;
+* `rdm-fast-patch-hardened\incremental-result.json`;
+* `rdm-fast-patch-hardened\incremental-attempt\ilc-profile.csv`;
+* `rdm-fast-patch-hardened\incremental-attempt\link-smoke-metadata.json`;
+* `entrymodel-hardened-sequential-gc\ilc-profile.csv`;
+* `tiny-hardened-revert\ilc-profile.csv`.
+
 ## Reproduction
 
 1. Check out runtime tag `v10.0.11`.
@@ -628,6 +826,27 @@ are in `11-combined-all-waves\link-metadata.json` and `smoke-metadata.json`.
    ```
 
 6. Run `Analyze-IlcProfile.ps1` to produce compact CSV summaries.
+
+For an incremental prototype invocation, use:
+
+```powershell
+.\Invoke-IncrementalIlcPrototype.ps1 `
+    -IlcPath <local-ilc.exe> `
+    -BaseResponseFile <v1.ilc.rsp> `
+    -UpdatedResponseFile <v2.ilc.rsp> `
+    -BaseAssembly <v1.dll> `
+    -UpdatedAssembly <v2.dll> `
+    -WorkingDirectory <input-directory> `
+    -RunRoot <new-output-directory> `
+    -Experiments <accepted-experiment-list> `
+    -FastObjectPatch
+```
+
+Omit `-FastObjectPatch` to benchmark graph reuse with complete object re-emission. The runner
+compares every incremental hit to an independent clean updated build by default and fails on
+any object mismatch. Pass `-SkipCleanValidation` only for a timing run that is already paired
+with a separately verified clean control. An explicit compiler or response-semantics fallback
+automatically runs the clean updated build.
 
 Bulky profile outputs belong under `artifacts/` or another ignored directory, not source
 control.

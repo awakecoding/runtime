@@ -125,7 +125,7 @@
     <Error Condition="'$(DisableUnsupportedError)' != 'true' and '$(OS)' == 'Windows_NT' and '$(_targetOS)' != 'win'"
       Text="Cross-OS native compilation is not supported." />
 
-    <Error Condition="'$(DisableUnsupportedError)' != 'true' and '$(OS)' != 'Windows_NT' and '$(_targetOS)' == 'win'"
+    <Error Condition="'$(DisableUnsupportedError)' != 'true' and '$(EnableCrossOsNativeCompilation)' != 'true' and '$(OS)' != 'Windows_NT' and '$(_targetOS)' == 'win'"
       Text="Cross-OS native compilation is not supported." />
 
     <Error Condition="'$(IlcHostPackagePath)' == '' and '$(RuntimePackagePath)' != ''"

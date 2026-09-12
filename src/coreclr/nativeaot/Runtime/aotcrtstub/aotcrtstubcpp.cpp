@@ -1,5 +1,5 @@
-// Licensed to the .NET Foundation under one or more agreements.
-// The .NET Foundation licenses this file to you under the MIT license.
+// Copyright (c) 2026 Marc-André Moreau.
+// Licensed under the MIT License.
 
 //
 // The C++ half of aotcrtstub: the global allocation operators and the TLS

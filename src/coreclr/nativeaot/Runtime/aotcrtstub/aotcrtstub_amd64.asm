@@ -1,5 +1,5 @@
-; Licensed to the .NET Foundation under one or more agreements.
-; The .NET Foundation licenses this file to you under the MIT license.
+; Copyright (c) 2026 Marc-André Moreau.
+; Licensed under the MIT License.
 
 ;
 ; The two aotcrtstub symbols whose register contracts cannot be expressed in C.

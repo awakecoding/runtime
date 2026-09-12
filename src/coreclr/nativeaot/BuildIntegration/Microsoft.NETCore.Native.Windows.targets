@@ -47,6 +47,7 @@ The .NET Foundation licenses this file to you under the MIT license.
       <NativeLibrary Condition="'$(IlcMultiModule)' == 'true'" Include="$(SharedLibrary)" />
       <NativeLibrary Include="$(IlcSdkPath)$(StandaloneGCSupportName)$(LibrarySuffix)" />
       <NativeLibrary Include="$(IlcSdkPath)aotminipal$(LibFileExt)" />
+      <NativeLibrary Condition="'$(UseAotCrtStub)' == 'true'" Include="$(IlcSdkPath)aotcrtstub$(LibrarySuffix)" />
       <NativeLibrary Include="$(IlcSdkPath)zlibstatic$(LibFileExt)" />
       <NativeLibrary Include="$(IlcSdkPath)brotlicommon$(LibFileExt)" />
       <NativeLibrary Include="$(IlcSdkPath)brotlienc$(LibFileExt)" />
@@ -104,6 +105,7 @@ The .NET Foundation licenses this file to you under the MIT license.
       <LinkerArg Condition="'$(NativeLib)' == ''" Include="/ENTRY:$(EntryPointSymbol) /NOIMPLIB /STACK:$(IlcDefaultStackSize)" />
       <!-- Older lld-link versions do not recognize /NOEXP. -->
       <LinkerArg Condition="'$(NativeLib)' == '' and '$(LinkerSupportsNoExp)' != 'false'" Include="/NOEXP" />
+      <LinkerArg Condition="'$(UseAotCrtStub)' == 'true'" Include="/NODEFAULTLIB:libcmt.lib /NODEFAULTLIB:libvcruntime.lib" Shim="true" />
       <LinkerArg Include="/NATVIS:&quot;$(MSBuildThisFileDirectory)NativeAOT.natvis&quot;" />
       <LinkerArg Condition="'$(ControlFlowGuard)' == 'Guard'" Include="/guard:cf" Shim="true" />
       <LinkerArg Condition="'$(_targetArchitecture)' == 'x86'" Include="/safeseh" Shim="true" />

@@ -101,6 +101,10 @@ include_directories(${GC_DIR}/env)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/eventpipe/inc)
 include_directories(${RUNTIME_DIR})
 
+if (CLR_CMAKE_TARGET_WIN32)
+  add_subdirectory(aotcrtstub)
+endif()
+
 if (WIN32)
   set(GC_HEADERS
     ${GC_DIR}/env/common.h

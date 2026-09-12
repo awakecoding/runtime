@@ -1,0 +1,26 @@
+;
+; ntdll.dll exports a subset of the C runtime. The Windows SDK's ntdll.lib
+; deliberately omits them, so we synthesize an x86 import library from this
+; module definition instead.
+;
+LIBRARY ntdll.dll
+
+EXPORTS
+    memcpy
+    memmove
+    memset
+    memcmp
+    memchr
+    strstr
+    wcsrchr
+    _alldiv
+    _allmul
+    _allrem
+    _allshl
+    _aulldiv
+    _aullrem
+    _aullshr
+    _alloca_probe
+    _alloca_probe_16
+    _chkstk
+    _except_handler4_common

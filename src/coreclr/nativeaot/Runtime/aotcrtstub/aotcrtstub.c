@@ -43,11 +43,43 @@ int _fltused = 0x9875;
 UINT_PTR __security_cookie = AOTCRT_DEFAULT_SECURITY_COOKIE;
 UINT_PTR __security_cookie_complement = ~(UINT_PTR)AOTCRT_DEFAULT_SECURITY_COOKIE;
 
+#if defined(_WIN64)
 __declspec(noreturn) void __cdecl __report_gsfailure(UINT_PTR stackCookie)
 {
     (void)stackCookie;
+#else
+__declspec(noreturn) void __cdecl __report_gsfailure(void)
+{
+#endif
     __fastfail(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE);
 }
+
+#if defined(_M_IX86)
+extern void __fastcall __security_check_cookie(UINT_PTR stackCookie);
+
+EXCEPTION_DISPOSITION __cdecl _except_handler4_common(
+    UINT_PTR* securityCookie,
+    void (__fastcall* checkCookie)(UINT_PTR),
+    PEXCEPTION_RECORD exceptionRecord,
+    PVOID establisherFrame,
+    PCONTEXT contextRecord,
+    PVOID dispatcherContext);
+
+EXCEPTION_DISPOSITION __cdecl _except_handler4(
+    PEXCEPTION_RECORD exceptionRecord,
+    PVOID establisherFrame,
+    PCONTEXT contextRecord,
+    PVOID dispatcherContext)
+{
+    return _except_handler4_common(
+        &__security_cookie,
+        __security_check_cookie,
+        exceptionRecord,
+        establisherFrame,
+        contextRecord,
+        dispatcherContext);
+}
+#endif
 
 void __cdecl __report_rangecheckfailure(void)
 {
@@ -141,7 +173,9 @@ UINT_PTR __guard_check_icall_fptr = (UINT_PTR)&AotCrtGuardCheckIcallNop;
 // Defined in the architecture-specific assembly file: unlike the check
 // variant, the dispatch thunk takes its target in a volatile register and
 // tail-calls it, so it cannot be written in C.
+#if defined(_WIN64)
 extern UINT_PTR __guard_dispatch_icall_fptr;
+#endif
 
 //
 // TLS support.
@@ -180,12 +214,12 @@ __declspec(allocate(".tls$ZZZ")) char _tls_end = 0;
 __declspec(allocate(".CRT$XLA")) PIMAGE_TLS_CALLBACK __xl_a = NULL;
 __declspec(allocate(".CRT$XLZ")) PIMAGE_TLS_CALLBACK __xl_z = NULL;
 
-__declspec(allocate(".rdata$T")) const IMAGE_TLS_DIRECTORY64 _tls_used =
+__declspec(allocate(".rdata$T")) const IMAGE_TLS_DIRECTORY _tls_used =
 {
-    (ULONGLONG)&_tls_start,
-    (ULONGLONG)&_tls_end,
-    (ULONGLONG)&_tls_index,
-    (ULONGLONG)(&__xl_a + 1),
+    (ULONG_PTR)&_tls_start,
+    (ULONG_PTR)&_tls_end,
+    (ULONG_PTR)&_tls_index,
+    (ULONG_PTR)(&__xl_a + 1),
     0,
     0
 };
@@ -217,21 +251,32 @@ extern BYTE __guard_longjmp_count;
 extern BYTE __guard_eh_cont_table[];
 extern BYTE __guard_eh_cont_count;
 
-__declspec(allocate(".rdata$T")) const IMAGE_LOAD_CONFIG_DIRECTORY64 _load_config_used =
+#if !defined(_WIN64)
+extern BYTE __safe_se_handler_table[];
+extern BYTE __safe_se_handler_count;
+#endif
+
+__declspec(allocate(".rdata$T")) const IMAGE_LOAD_CONFIG_DIRECTORY _load_config_used =
 {
-    .Size = sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64),
-    .SecurityCookie = (ULONGLONG)&__security_cookie,
-    .GuardCFCheckFunctionPointer = (ULONGLONG)&__guard_check_icall_fptr,
-    .GuardCFDispatchFunctionPointer = (ULONGLONG)&__guard_dispatch_icall_fptr,
-    .GuardCFFunctionTable = (ULONGLONG)&__guard_fids_table,
-    .GuardCFFunctionCount = (ULONGLONG)&__guard_fids_count,
+    .Size = sizeof(IMAGE_LOAD_CONFIG_DIRECTORY),
+    .SecurityCookie = (ULONG_PTR)&__security_cookie,
+#if !defined(_WIN64)
+    .SEHandlerTable = (ULONG_PTR)&__safe_se_handler_table,
+    .SEHandlerCount = (ULONG_PTR)&__safe_se_handler_count,
+#endif
+    .GuardCFCheckFunctionPointer = (ULONG_PTR)&__guard_check_icall_fptr,
+#if defined(_WIN64)
+    .GuardCFDispatchFunctionPointer = (ULONG_PTR)&__guard_dispatch_icall_fptr,
+#endif
+    .GuardCFFunctionTable = (ULONG_PTR)&__guard_fids_table,
+    .GuardCFFunctionCount = (ULONG_PTR)&__guard_fids_count,
     .GuardFlags = (DWORD)(ULONG_PTR)&__guard_flags,
-    .GuardAddressTakenIatEntryTable = (ULONGLONG)&__guard_iat_table,
-    .GuardAddressTakenIatEntryCount = (ULONGLONG)&__guard_iat_count,
-    .GuardLongJumpTargetTable = (ULONGLONG)&__guard_longjmp_table,
-    .GuardLongJumpTargetCount = (ULONGLONG)&__guard_longjmp_count,
-    .GuardEHContinuationTable = (ULONGLONG)&__guard_eh_cont_table,
-    .GuardEHContinuationCount = (ULONGLONG)&__guard_eh_cont_count
+    .GuardAddressTakenIatEntryTable = (ULONG_PTR)&__guard_iat_table,
+    .GuardAddressTakenIatEntryCount = (ULONG_PTR)&__guard_iat_count,
+    .GuardLongJumpTargetTable = (ULONG_PTR)&__guard_longjmp_table,
+    .GuardLongJumpTargetCount = (ULONG_PTR)&__guard_longjmp_count,
+    .GuardEHContinuationTable = (ULONG_PTR)&__guard_eh_cont_table,
+    .GuardEHContinuationCount = (ULONG_PTR)&__guard_eh_cont_count
 };
 
 //

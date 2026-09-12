@@ -10,7 +10,8 @@
 // here: memcpy memmove memset memcmp memchr strstr wcsrchr
 //        __C_specific_handler __chkstk
 //
-// Symbols that cannot be expressed in C live in aotcrtstub_amd64.asm:
+// Symbols that cannot be expressed in C live in the architecture-specific
+// aotcrtstub assembly file:
 //        __security_check_cookie __guard_dispatch_icall_fptr
 //
 
@@ -126,7 +127,8 @@ void __cdecl __security_init_cookie(void)
 //
 // The loader rewrites these pointers when it loads a CFG-enabled image on a
 // CFG-enabled system. Until then they must point at something callable.
-// __guard_check_icall_fptr receives the call target in RCX and validates it;
+// __guard_check_icall_fptr receives the call target in the platform ABI
+// argument register and validates it;
 // for an image with no guard CF table there is nothing to check.
 //
 static void __cdecl AotCrtGuardCheckIcallNop(UINT_PTR target)
@@ -136,8 +138,9 @@ static void __cdecl AotCrtGuardCheckIcallNop(UINT_PTR target)
 
 UINT_PTR __guard_check_icall_fptr = (UINT_PTR)&AotCrtGuardCheckIcallNop;
 
-// Defined in aotcrtstub_amd64.asm: unlike the check variant, the dispatch
-// thunk takes its target in RAX and tail-calls it, so it cannot be written in C.
+// Defined in the architecture-specific assembly file: unlike the check
+// variant, the dispatch thunk takes its target in a volatile register and
+// tail-calls it, so it cannot be written in C.
 extern UINT_PTR __guard_dispatch_icall_fptr;
 
 //

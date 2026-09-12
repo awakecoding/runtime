@@ -1,11 +1,20 @@
-if (NOT CLR_CMAKE_TARGET_WIN32 OR NOT CLR_CMAKE_TARGET_ARCH_AMD64)
+if (NOT CLR_CMAKE_TARGET_WIN32 OR
+    (NOT CLR_CMAKE_TARGET_ARCH_AMD64 AND NOT CLR_CMAKE_TARGET_ARCH_ARM64))
   return()
+endif()
+
+if (CLR_CMAKE_TARGET_ARCH_AMD64)
+  set(AOTCRTSTUB_ARCH_SOURCES aotcrtstub_amd64.asm)
+  set(NTDLLCRT_MACHINE X64)
+else()
+  set(AOTCRTSTUB_ARCH_SOURCES aotcrtstub_arm64.asm)
+  set(NTDLLCRT_MACHINE ARM64)
 endif()
 
 add_library(aotcrtstub STATIC
   aotcrtstub.c
   aotcrtstubcpp.cpp
-  aotcrtstub_amd64.asm)
+  ${AOTCRTSTUB_ARCH_SOURCES})
 
 set_target_properties(aotcrtstub PROPERTIES
   INTERPROCEDURAL_OPTIMIZATION OFF)
@@ -19,7 +28,7 @@ install_static_library(aotcrtstub aotsdk nativeaot)
 set(NTDLLCRT_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/ntdllcrt.lib")
 add_custom_command(
   OUTPUT "${NTDLLCRT_LIBRARY}"
-  COMMAND "${CMAKE_AR}" /nologo /DEF:"${CMAKE_CURRENT_SOURCE_DIR}/ntdllcrt.def" /MACHINE:X64 /OUT:"${NTDLLCRT_LIBRARY}"
+  COMMAND "${CMAKE_AR}" /nologo /DEF:"${CMAKE_CURRENT_SOURCE_DIR}/ntdllcrt.def" /MACHINE:${NTDLLCRT_MACHINE} /OUT:"${NTDLLCRT_LIBRARY}"
   DEPENDS ntdllcrt.def
   VERBATIM)
 
